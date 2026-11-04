@@ -1,0 +1,21 @@
+name: Register Discord commands
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - register.mjs
+  workflow_dispatch:
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node register.mjs
+        env:
+          APP_ID: ${{ secrets.DISCORD_APP_ID }}
+          BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}

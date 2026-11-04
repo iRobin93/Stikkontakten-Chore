@@ -1,0 +1,31 @@
+name: Deploy bot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - index.mjs
+      - package.json
+      - package-lock.json
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --omit=dev
+      - run: zip -r bot.zip index.mjs package.json node_modules
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-north-1
+      - run: aws lambda update-function-code --function-name my-bot --zip-file fileb://bot.zip
+      - run: aws lambda wait function-updated --function-name my-bot
