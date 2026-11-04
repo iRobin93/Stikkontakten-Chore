@@ -1,10 +1,66 @@
 const commands = [
   { name: "ping", description: "Replies with pong" },
   {
-    name: "hello",
-    description: "Greet someone",
+    name: "chores",
+    description: "Volunteer chores",
     options: [
-      { type: 6, name: "user", description: "Who to greet", required: false },
+      {
+        type: 1,
+        name: "add",
+        description: "Add a chore (organizers only)",
+        options: [
+          {
+            type: 3,
+            name: "name",
+            description: "What needs doing",
+            required: true,
+          },
+          {
+            type: 3,
+            name: "date",
+            description: "Date as YYYY-MM-DD",
+            required: true,
+          },
+          {
+            type: 4,
+            name: "spots",
+            description: "How many volunteers (default 1)",
+            min_value: 1,
+            max_value: 50,
+          },
+        ],
+      },
+      { type: 1, name: "list", description: "Show upcoming chores" },
+      {
+        type: 1,
+        name: "signup",
+        description: "Claim a spot on a chore",
+        options: [
+          {
+            type: 3,
+            name: "id",
+            description: "Chore ID from /chores list",
+            required: true,
+          },
+        ],
+      },
+      {
+        type: 1,
+        name: "drop",
+        description: "Give up your spot on a chore",
+        options: [
+          { type: 3, name: "id", description: "Chore ID", required: true },
+        ],
+      },
+      { type: 1, name: "mine", description: "Show chores you signed up for" },
+      {
+        type: 1,
+        name: "remove",
+        description: "Delete a chore (organizers only)",
+        options: [
+          { type: 3, name: "id", description: "Chore ID", required: true },
+        ],
+      },
     ],
   },
 ];
