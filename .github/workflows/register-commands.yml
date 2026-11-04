@@ -2,14 +2,16 @@ name: Register Discord commands
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - register.mjs
+      - .github/workflows/register-commands.yml
   workflow_dispatch:
 
 jobs:
   register:
     runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'test' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

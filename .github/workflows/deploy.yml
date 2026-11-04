@@ -2,11 +2,12 @@ name: Deploy bot
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - index.mjs
       - package.json
       - package-lock.json
+      - .github/workflows/deploy.yml
   workflow_dispatch:
 
 permissions:
@@ -16,16 +17,23 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'production' || 'test' }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
       - run: npm ci --omit=dev
+
       - run: zip -r bot.zip index.mjs package.json node_modules
+
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: eu-north-1
-      - run: aws lambda update-function-code --function-name my-bot --zip-file fileb://bot.zip
-      - run: aws lambda wait function-updated --function-name my-bot
+
+      - run: aws lambda update-function-code --function-name ${{ vars.LAMBDA_NAME }} --zip-file fileb://bot.zip
+
+      - run: aws lambda wait function-updated --function-name ${{ vars.LAMBDA_NAME }}
