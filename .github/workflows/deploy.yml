@@ -17,7 +17,7 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: ${{ github.ref_name == 'main' && 'production' || 'test' }}
+    environment: ${{ github.ref_name == 'main' && 'Prod' || 'Dev' }}
     steps:
       - uses: actions/checkout@v4
 
