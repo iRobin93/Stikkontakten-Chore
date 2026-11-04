@@ -88,3 +88,5 @@ console.log(
   `Registered ${data.length} commands:`,
   data.map((c) => c.name).join(", "),
 );
+
+// Testing
