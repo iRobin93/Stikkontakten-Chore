@@ -287,15 +287,14 @@ const commands = [
       },
       {
         type: STRING,
-        name: "dato",
-        description: "Dato som ÅÅÅÅ-MM-DD",
+        name: "klokkeslett",
+        description: "Starttid som TT:MM (norsk tid)",
         required: true,
       },
       {
         type: STRING,
-        name: "klokkeslett",
-        description: "Starttid som TT:MM (norsk tid)",
-        required: true,
+        name: "dato",
+        description: "ÅÅÅÅ-MM-DD (standard: i dag)",
       },
       {
         type: INTEGER,

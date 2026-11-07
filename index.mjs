@@ -2173,16 +2173,21 @@ function renderMeeting(m) {
 
 async function cmdMote(i, opts, userId) {
   if (!canManage(i)) return ephemeral(NO_ACCESS);
-  if (
-    !/^\d{4}-\d{2}-\d{2}$/.test(opts.dato) ||
-    Number.isNaN(Date.parse(opts.dato))
-  )
+  // Dato er valgfri og settes til i dag (norsk tid) hvis den utelates
+  const dato = opts.dato ?? todayOslo();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dato) || Number.isNaN(Date.parse(dato)))
     return ephemeral("Bruk datoformatet ÅÅÅÅ-MM-DD, f.eks. 2026-11-20.");
-  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(opts.klokkeslett))
+  // Tillat «18:30», «9:30» og «18.30»
+  const time = /^([01]?\d|2[0-3])[:.]([0-5]\d)$/.exec(opts.klokkeslett.trim());
+  if (!time)
     return ephemeral("Bruk klokkeslett som TT:MM, f.eks. 18:30 (norsk tid).");
-  const startsAt = osloLocalToIso(opts.dato, opts.klokkeslett);
+  const startsAt = osloLocalToIso(dato, `${pad(Number(time[1]))}:${time[2]}`);
   if (Date.parse(startsAt) < Date.now())
-    return ephemeral("Tidspunktet er i fortiden.");
+    return ephemeral(
+      opts.dato
+        ? "Tidspunktet er i fortiden."
+        : "Det klokkeslettet har allerede vært i dag. Legg til `dato` hvis møtet er en annen dag (ÅÅÅÅ-MM-DD).",
+    );
 
   const id = randomBytes(4).toString("hex");
   const meeting = {
