@@ -1446,7 +1446,7 @@ const COMMANDS = {
   møte: cmdMote,
   foreslå: cmdForesla,
   takk: cmdTakk,
-  idé: cmdIde,
+  ide: cmdIde,
   "ny-gjest": cmdNyGjest,
   leaderboard: cmdLeaderboard,
 };
