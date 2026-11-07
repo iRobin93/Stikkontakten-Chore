@@ -50,6 +50,51 @@ const commands = [
     ],
   },
 
+  {
+    name: "takk",
+    description: "Gi en takk til en annen frivillig",
+    options: [
+      {
+        type: USER,
+        name: "bruker",
+        description: "Hvem vil du takke?",
+        required: true,
+      },
+      {
+        type: STRING,
+        name: "melding",
+        description: "En liten hilsen (valgfri)",
+        max_length: 200,
+      },
+    ],
+  },
+  {
+    name: "idé",
+    description: "Send inn en anonym idé",
+    options: [
+      {
+        type: STRING,
+        name: "tekst",
+        description: "Hva er ideen din?",
+        required: true,
+        max_length: 500,
+      },
+    ],
+  },
+  {
+    name: "ny-gjest",
+    description: "Meld at du tok med en ny besøkende",
+    options: [
+      {
+        type: STRING,
+        name: "merknad",
+        description: "Valgfritt: kort merknad, ikke fullt navn",
+        max_length: 100,
+      },
+    ],
+  },
+  { name: "leaderboard", description: "Se månedens aktive (hvis slått på)" },
+
   // ---- Admin/leder ----
   {
     name: "oppgave-ny",
@@ -268,36 +313,8 @@ const commands = [
       {
         type: STRING,
         name: "innstilling",
-        description: "Hvilken innstilling?",
-        choices: [
-          { name: "Dager før innsjekk", value: "checkinDays" },
-          {
-            name: "Maks aktive oppgaver (0 = ingen grense)",
-            value: "maxActiveTasks",
-          },
-          { name: "Poeng: lite", value: "pointsSmall" },
-          { name: "Poeng: middels", value: "pointsMedium" },
-          { name: "Poeng: stort", value: "pointsLarge" },
-          { name: "Admin-kanal (godkjenning)", value: "adminChannelId" },
-          {
-            name: "Reservekanal (innsjekk uten DM)",
-            value: "fallbackChannelId",
-          },
-          { name: "Kanal for ukesoppsummering", value: "summaryChannelId" },
-          { name: "Poeng for møteoppmøte", value: "meetingPoints" },
-          {
-            name: "Innsjekk åpner (min før møtestart)",
-            value: "meetingCheckinBeforeMin",
-          },
-          {
-            name: "Innsjekk stenger (min etter møtestart)",
-            value: "meetingCheckinAfterMin",
-          },
-          {
-            name: "Dager før varsel om utatt oppgave",
-            value: "untakenAlertDays",
-          },
-        ],
+        description: "Hvilken innstilling? (la stå tom for å se alle)",
+        autocomplete: true,
       },
       { type: STRING, name: "verdi", description: "Ny verdi" },
     ],

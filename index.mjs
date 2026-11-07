@@ -1,4 +1,4 @@
-// Frivillig-bot for gamingsenter – Lambda-handler (fase 1 + 2)
+// Frivillig-bot for gamingsenter – Lambda-handler (fase 1–3)
 // Discord kaller denne via Lambda Function URL. EventBridge kaller den for planlagte jobber.
 
 import { verifyKey } from "discord-interactions";
@@ -47,6 +47,26 @@ const DEFAULT_SETTINGS = {
   meetingCheckinBeforeMin: 15, // innsjekk åpner så mange minutter før start
   meetingCheckinAfterMin: 180, // og stenger så mange minutter etter start
   untakenAlertDays: 3, // admin-varsel hvis ingen har tatt en oppgave (0 = av)
+  // Nivåer (nivå beregnes av totalEarned). Plassholdere – sett dine egne.
+  levelVeteranPoints: 100,
+  levelLegendPoints: 500,
+  roleRecruitId: null,
+  roleVeteranId: null,
+  roleLegendId: null,
+  // Streak og multiplikator: bonuser summeres og kappes på multiplierCap
+  streakStep: 0.1, // +0,1 per streak-uke
+  streakMax: 0.5, // maks streak-bonus (×1,5 etter 5 uker)
+  multiplierCap: 1.5,
+  // Takk, idé, ny gjest
+  thanksPoints: 2,
+  thanksMaxPerWeek: 3,
+  ideaPoints: 20,
+  guestPoints: 15,
+  guestMaxPerWeek: 3,
+  // Toppliste og kanaler
+  leaderboardEnabled: 0, // 1 = på
+  photoChannelId: process.env.PHOTO_CHANNEL_ID ?? null,
+  shoutoutChannelId: process.env.SHOUTOUT_CHANNEL_ID ?? null,
 };
 
 const SETTING_DEFS = {
@@ -90,6 +110,72 @@ const SETTING_DEFS = {
     max: 60,
     label: "Dager før admin-varsel om utatt oppgave (0 = av)",
   },
+  levelVeteranPoints: {
+    type: "int",
+    min: 1,
+    max: 100000,
+    label: "Nivå Veteran: poeng som kreves",
+  },
+  levelLegendPoints: {
+    type: "int",
+    min: 1,
+    max: 100000,
+    label: "Nivå Legende: poeng som kreves",
+  },
+  roleRecruitId: { type: "id", label: "Discord-rolle: Rekrutt" },
+  roleVeteranId: { type: "id", label: "Discord-rolle: Veteran" },
+  roleLegendId: { type: "id", label: "Discord-rolle: Legende" },
+  streakStep: {
+    type: "float",
+    min: 0,
+    max: 1,
+    label: "Streak: bonus per uke (f.eks. 0,1)",
+  },
+  streakMax: {
+    type: "float",
+    min: 0,
+    max: 4,
+    label: "Streak: maks bonus (f.eks. 0,5)",
+  },
+  multiplierCap: {
+    type: "float",
+    min: 1,
+    max: 5,
+    label: "Multiplikator: maks totalt (f.eks. 1,5)",
+  },
+  thanksPoints: { type: "int", min: 0, max: 1000, label: "Poeng per takk" },
+  thanksMaxPerWeek: {
+    type: "int",
+    min: 1,
+    max: 50,
+    label: "Maks takk man kan gi per uke",
+  },
+  ideaPoints: {
+    type: "int",
+    min: 0,
+    max: 10000,
+    label: "Standardpoeng for idé tatt i bruk",
+  },
+  guestPoints: {
+    type: "int",
+    min: 0,
+    max: 10000,
+    label: "Poeng for ny ordinær besøkende",
+  },
+  guestMaxPerWeek: {
+    type: "int",
+    min: 1,
+    max: 50,
+    label: "Maks gjester man kan melde per uke",
+  },
+  leaderboardEnabled: {
+    type: "int",
+    min: 0,
+    max: 1,
+    label: "Toppliste (1 = på, 0 = av)",
+  },
+  photoChannelId: { type: "id", label: "Bildekanal (#før-og-etter)" },
+  shoutoutChannelId: { type: "id", label: "Kanal for månedens frivillige" },
 };
 
 const NO_ACCESS = "Dette er forbeholdt admin/leder 🙂";
@@ -159,20 +245,23 @@ const canManage = (i) => isAdmin(i) || isLeader(i);
  * Discord REST
  * ============================================================ */
 
-async function discord(path, { method = "GET", body, retry = true } = {}) {
+async function discord(
+  path,
+  { method = "GET", body, form, retry = true } = {},
+) {
   const res = await fetch(`${DISCORD_API}${path}`, {
     method,
     headers: {
       Authorization: `Bot ${process.env.DISCORD_TOKEN}`,
-      "Content-Type": "application/json",
+      ...(form ? {} : { "Content-Type": "application/json" }),
     },
-    body: body ? JSON.stringify(body) : undefined,
+    body: form ?? (body ? JSON.stringify(body) : undefined),
     signal: AbortSignal.timeout(5000),
   });
   if (res.status === 429 && retry) {
     const { retry_after = 1 } = await res.json().catch(() => ({}));
     await new Promise((r) => setTimeout(r, Math.min(retry_after, 5) * 1000));
-    return discord(path, { method, body, retry: false });
+    return discord(path, { method, body, form, retry: false });
   }
   if (!res.ok) {
     const text = await res.text();
@@ -355,7 +444,8 @@ const taskSlotUpdate = (taskId, delta) => ({
   },
 });
 
-// Poeng: atomisk saldo + loggrad. Returnerer to transaksjonselementer.
+// Poeng: atomisk saldo + loggrad + månedsteller (til månedens frivillige/topplisten).
+// `streak` (valgfri) oppdaterer streak-feltene på brukeren i samme operasjon.
 function pointsOps({
   userId,
   delta,
@@ -364,40 +454,63 @@ function pointsOps({
   reason,
   givenBy,
   taskId,
+  streak,
 }) {
   const ts = now();
+  const sets = ["createdAt = if_not_exists(createdAt, :ts)"];
+  const values = { ":ts": ts, ":d": delta };
+  if (streak) {
+    sets.push(
+      "attendanceStreak = :sv",
+      "lastStreakWeek = :sw",
+      "lastStreakMonday = :sm",
+    );
+    values[":sv"] = streak.value;
+    values[":sw"] = streak.week;
+    values[":sm"] = streak.monday;
+  }
   const update = {
     Update: {
       TableName: TABLE,
       Key: userKey(userId),
-      UpdateExpression:
-        "SET createdAt = if_not_exists(createdAt, :ts) ADD #pts :d, totalEarned :d",
+      UpdateExpression: `SET ${sets.join(", ")} ADD #pts :d, totalEarned :d`,
       ExpressionAttributeNames: { "#pts": "points" },
-      ExpressionAttributeValues: { ":ts": ts, ":d": delta },
+      ExpressionAttributeValues: values,
     },
   };
   if (delta < 0) {
     update.Update.ConditionExpression = "#pts >= :min";
     update.Update.ExpressionAttributeValues[":min"] = -delta;
   }
-  const log = {
-    Put: {
-      TableName: TABLE,
-      Item: {
-        PK: `USER#${userId}`,
-        SK: `LOG#${ts}#${randomUUID()}`,
-        entity: "LOG",
-        delta,
-        basePoints,
-        multiplier,
-        reason,
-        givenBy,
-        taskId,
-        createdAt: ts,
+  const ops = [update];
+  if (delta !== 0) {
+    ops.push({
+      Put: {
+        TableName: TABLE,
+        Item: {
+          PK: `USER#${userId}`,
+          SK: `LOG#${ts}#${randomUUID()}`,
+          entity: "LOG",
+          delta,
+          basePoints,
+          multiplier,
+          reason,
+          givenBy,
+          taskId,
+          createdAt: ts,
+        },
       },
-    },
-  };
-  return [update, log];
+    });
+    ops.push({
+      Update: {
+        TableName: TABLE,
+        Key: { PK: `MONTH#${todayOslo().slice(0, 7)}`, SK: `USER#${userId}` },
+        UpdateExpression: "SET userId = :u ADD earned :d",
+        ExpressionAttributeValues: { ":u": userId, ":d": delta },
+      },
+    });
+  }
+  return ops;
 }
 
 /* ============================================================
@@ -864,6 +977,9 @@ async function approveCompletion(taskId, userId, reviewerId) {
   if (!task || !completion)
     return { ok: false, text: "Fant ikke ferdigmeldingen." };
 
+  const award = await computeAward(userId, task.points ?? 0, {
+    attendance: true,
+  });
   const ts = now();
   const items = [
     {
@@ -877,7 +993,7 @@ async function approveCompletion(taskId, userId, reviewerId) {
         ExpressionAttributeValues: {
           ":a": "approved",
           ":wk": `APPROVED#${isoWeekKey(todayOslo())}`,
-          ":pts": task.points ?? 0,
+          ":pts": award.delta,
           ":p": "pending",
           ":r": reviewerId,
           ":ts": ts,
@@ -894,17 +1010,18 @@ async function approveCompletion(taskId, userId, reviewerId) {
       },
     },
   ];
-  if (task.points > 0) {
-    items.push(
-      ...pointsOps({
-        userId,
-        delta: task.points,
-        reason: `Fullført oppgave: ${task.title}`,
-        givenBy: reviewerId,
-        taskId,
-      }),
-    );
-  }
+  items.push(
+    ...pointsOps({
+      userId,
+      delta: award.delta,
+      basePoints: award.basePoints,
+      multiplier: award.multiplier,
+      streak: award.streakUpdate,
+      reason: `Fullført oppgave: ${task.title}`,
+      givenBy: reviewerId,
+      taskId,
+    }),
+  );
 
   const r = await transact(items);
   if (!r.ok) return { ok: false, text: "Denne er allerede behandlet." };
@@ -925,7 +1042,7 @@ async function approveCompletion(taskId, userId, reviewerId) {
       if (e.name !== "ConditionalCheckFailedException") throw e;
     });
 
-  return { ok: true, task };
+  return { ok: true, task, award, photoUrl: completion.photoUrl };
 }
 
 async function rejectCompletion(taskId, userId, reviewerId, comment) {
@@ -1046,6 +1163,8 @@ async function runJob(job) {
       return runNightly();
     case "weekly":
       return runWeekly();
+    case "monthly":
+      return runMonthly();
     default:
       console.log("Ukjent eller ikke-implementert jobb:", job);
       return { skipped: job };
@@ -1065,11 +1184,20 @@ async function cmdMine(i, opts, userId) {
 }
 
 async function cmdPoeng(i, opts, userId) {
-  const profile = await getItem(userKey(userId));
+  const [profile, settings] = await Promise.all([
+    getItem(userKey(userId)),
+    loadSettings(),
+  ]);
   if (!profile)
     return ephemeral(
       "Du har ikke fått poeng ennå. Ta en oppgave med `/oppgaver` 💪",
     );
+  const total = profile.totalEarned ?? 0;
+  const level = levelFor(total, settings);
+  const next = LEVELS[levelRank(level.key) + 1];
+  const streak = effectiveStreak(profile, todayOslo(), settings);
+  const mult = multiplierFor(streak, settings);
+
   const { Items: logs = [] } = await db.send(
     new QueryCommand({
       TableName: TABLE,
@@ -1080,14 +1208,20 @@ async function cmdPoeng(i, opts, userId) {
     }),
   );
   const recent = logs
-    .map(
-      (l) =>
-        `${l.delta > 0 ? "+" : ""}${l.delta} · ${l.reason} · ${discordTime(l.createdAt)}`,
-    )
+    .map((l) => {
+      const how =
+        l.multiplier > 1 ? ` (${l.basePoints} × ${fmtMult(l.multiplier)})` : "";
+      return `${l.delta > 0 ? "+" : ""}${l.delta}${how} · ${l.reason} · ${discordTime(l.createdAt)}`;
+    })
     .join("\n");
+
+  const lines = [
+    `⭐ Du har **${profile.points ?? 0} poeng**.`,
+    `🏅 Nivå: **${level.name}**${next ? ` (${Math.max(0, settings[next.min] - total)} poeng til ${next.name})` : ""}`,
+    `🔥 Streak: **${streak} uke${streak === 1 ? "" : "r"}**, multiplikator **×${fmtMult(mult)}**`,
+  ];
   return ephemeral(
-    `⭐ Du har **${profile.points ?? 0} poeng**.` +
-      (recent ? `\n\n**Siste endringer**\n${recent}` : ""),
+    lines.join("\n") + (recent ? `\n\n**Siste endringer**\n${recent}` : ""),
   );
 }
 
@@ -1200,6 +1334,7 @@ async function cmdPoengJuster(i, opts, userId) {
   );
   if (!r.ok)
     return ephemeral("Brukeren har ikke nok poeng til å trekke så mange.");
+  await withTimeout(syncLevel(opts.bruker), 1500);
   const profile = await getItem(userKey(opts.bruker));
   return ephemeral(
     `✅ Justerte <@${opts.bruker}> med ${delta > 0 ? "+" : ""}${delta} poeng. Ny saldo: **${profile?.points ?? 0}**.`,
@@ -1240,9 +1375,20 @@ async function cmdInnstillinger(i, opts) {
     const lines = Object.entries(SETTING_DEFS).map(
       ([key, def]) => `• ${def.label}: **${show(key, settings[key])}**`,
     );
-    return ephemeral(
-      `**Innstillinger**\n${lines.join("\n")}\n\nEndre med \`/innstillinger innstilling:… verdi:…\``,
-    );
+    return message({
+      flags: 64,
+      embeds: [
+        {
+          title: "Innstillinger",
+          description:
+            `${lines.join("\n")}\n\nEndre med \`/innstillinger innstilling:… verdi:…\``.slice(
+              0,
+              4000,
+            ),
+          color: 0x5865f2,
+        },
+      ],
+    });
   }
 
   const def = SETTING_DEFS[opts.innstilling];
@@ -1251,7 +1397,16 @@ async function cmdInnstillinger(i, opts) {
     return ephemeral("Oppgi også en verdi.");
 
   let value;
-  if (def.type === "int") {
+  if (def.type === "float") {
+    const normalized = opts.verdi.replace(",", ".");
+    if (!/^\d+(\.\d+)?$/.test(normalized))
+      return ephemeral("Verdien må være et tall, f.eks. 0,1.");
+    value = Number(normalized);
+    if (value < def.min || value > def.max)
+      return ephemeral(
+        `Verdien må være mellom ${fmtMult(def.min)} og ${fmtMult(def.max)}.`,
+      );
+  } else if (def.type === "int") {
     if (!/^\d+$/.test(opts.verdi))
       return ephemeral("Verdien må være et heltall.");
     value = Number(opts.verdi);
@@ -1290,6 +1445,10 @@ const COMMANDS = {
   "mal-slett": cmdMalSlett,
   møte: cmdMote,
   foreslå: cmdForesla,
+  takk: cmdTakk,
+  idé: cmdIde,
+  "ny-gjest": cmdNyGjest,
+  leaderboard: cmdLeaderboard,
 };
 
 async function handleCommand(i) {
@@ -1328,6 +1487,19 @@ async function handleAutocomplete(i) {
 
   if (i.data.name === "mal-slett" && isAdmin(i)) {
     tasks = await listTemplates();
+  }
+  if (i.data.name === "innstillinger") {
+    const settingChoices = isAdmin(i)
+      ? Object.entries(SETTING_DEFS)
+          .filter(
+            ([key, def]) =>
+              def.label.toLowerCase().includes(typed) ||
+              key.toLowerCase().includes(typed),
+          )
+          .slice(0, 25)
+          .map(([key, def]) => ({ name: def.label.slice(0, 100), value: key }))
+      : [];
+    return json({ type: 8, data: { choices: settingChoices } });
   }
 
   const choices = tasks
@@ -1403,11 +1575,14 @@ async function handleComponent(i) {
         return ephemeral("Du kan ikke godkjenne din egen ferdigmelding 🙂");
       const r = await approveCompletion(taskId, targetId, user.id);
       if (!r.ok) return ephemeral(r.text);
-      await tryDM(targetId, {
-        content: `🎉 **${r.task.title}** er godkjent! Du fikk ${r.task.points} poeng. Takk for innsatsen!`,
-      });
+      const after = await afterApproval(r, targetId);
+      const photoNote = after.wantsPhoto
+        ? after.photoOk
+          ? " · 📸 bilde publisert"
+          : " · ⚠️ bildet kunne ikke publiseres"
+        : "";
       return updateMessage({
-        content: `✅ Godkjent av <@${user.id}> · <@${targetId}> fikk ${r.task.points} poeng for **${r.task.title}**`,
+        content: `✅ Godkjent av <@${user.id}> · <@${targetId}> fikk ${r.award.delta} poeng for **${r.task.title}**${awardNote(r.award)}${photoNote}`,
         embeds: i.message?.embeds ?? [],
         components: [],
       });
@@ -1465,6 +1640,19 @@ async function handleComponent(i) {
       return ephemeral(notice);
     }
 
+    case "idea_use":
+      if (!canManage(i)) return ephemeral(NO_ACCESS);
+      return ideaOpenModal(taskId); // taskId = idé-ID her
+
+    case "idea_arch":
+      return ideaArchive(i, taskId);
+
+    case "guest_ok":
+      return guestConfirm(i, taskId); // taskId = gjest-ID her
+
+    case "guest_no":
+      return guestReject(i, taskId);
+
     case "sg_ok":
     case "sg_no":
       if (!canManage(i)) return ephemeral(NO_ACCESS);
@@ -1477,6 +1665,7 @@ async function handleComponent(i) {
 
 async function handleModal(i) {
   const [action, taskId, targetId] = i.data.custom_id.split(":");
+  if (action === "idea_use_modal") return ideaUse(i, taskId);
   if (action === "sg_ok_modal") return suggestionApprove(i, taskId);
   if (action === "sg_no_modal") return suggestionReject(i, taskId);
   if (action !== "reject_modal") return ephemeral("Ukjent skjema.");
@@ -2137,19 +2326,24 @@ async function meetingHere(meetingId, userId) {
       },
     },
   ];
-  if (settings.meetingPoints > 0) {
-    items.push(
-      ...pointsOps({
-        userId,
-        delta: settings.meetingPoints,
-        reason: `Oppmøte: ${m.title}`,
-        givenBy: "system",
-      }),
-    );
-  }
+  const award = await computeAward(userId, settings.meetingPoints, {
+    attendance: true,
+  });
+  items.push(
+    ...pointsOps({
+      userId,
+      delta: award.delta,
+      basePoints: award.basePoints,
+      multiplier: award.multiplier,
+      streak: award.streakUpdate,
+      reason: `Oppmøte: ${m.title}`,
+      givenBy: "system",
+    }),
+  );
   const r = await transact(items);
   if (!r.ok) return "Du er allerede sjekket inn ✅";
-  return `✅ Du er sjekket inn på **${m.title}**${settings.meetingPoints > 0 ? ` og fikk ${settings.meetingPoints} poeng` : ""}. Fint at du kom! 💙`;
+  await withTimeout(syncLevel(userId), 1500);
+  return `✅ Du er sjekket inn på **${m.title}**${award.delta > 0 ? ` og fikk ${award.delta} poeng${awardNote(award)}` : ""}. Fint at du kom! 💙`;
 }
 
 /* ---------- Forslag til oppgaver ---------- */
@@ -2169,11 +2363,20 @@ const SIZE_ALIASES = {
 const textInputRow = (
   custom_id,
   label,
-  { style = 1, required = false, max_length, placeholder } = {},
+  { style = 1, required = false, max_length, placeholder, value } = {},
 ) => ({
   type: 1,
   components: [
-    { type: 4, custom_id, label, style, required, max_length, placeholder },
+    {
+      type: 4,
+      custom_id,
+      label,
+      style,
+      required,
+      max_length,
+      placeholder,
+      value,
+    },
   ],
 });
 const modalValue = (i, id) =>
@@ -2379,6 +2582,724 @@ async function suggestionReject(i, sugId) {
     embeds: i.message?.embeds ?? [],
     components: [],
   });
+}
+
+/* ============================================================
+ * Fase 3: nivåer, streak og multiplikator
+ * ============================================================ */
+
+const MONTHS = [
+  "januar",
+  "februar",
+  "mars",
+  "april",
+  "mai",
+  "juni",
+  "juli",
+  "august",
+  "september",
+  "oktober",
+  "november",
+  "desember",
+];
+
+const LEVELS = [
+  { key: "recruit", name: "Rekrutt", role: "roleRecruitId" },
+  {
+    key: "veteran",
+    name: "Veteran",
+    min: "levelVeteranPoints",
+    role: "roleVeteranId",
+  },
+  {
+    key: "legend",
+    name: "Legende",
+    min: "levelLegendPoints",
+    role: "roleLegendId",
+  },
+];
+const levelRank = (key) => LEVELS.findIndex((l) => l.key === key);
+function levelFor(total, s) {
+  let current = LEVELS[0];
+  for (const l of LEVELS) if (l.min && total >= s[l.min]) current = l;
+  return current;
+}
+const fmtMult = (m) => String(m).replace(".", ",");
+
+// Kjør noe «best effort» innen en tidsramme, så vi holder oss under Discords 3 sekunder
+const withTimeout = (promise, ms, fallback = null) =>
+  Promise.race([
+    Promise.resolve(promise).catch((err) => {
+      console.warn("withTimeout:", err.message);
+      return fallback;
+    }),
+    new Promise((resolve) => setTimeout(() => resolve(fallback), ms)),
+  ]);
+
+const mondayOf = (dateStr) => addDays(dateStr, -(isoWeekday(dateStr) - 1));
+const weeksBetween = (mondayA, mondayB) =>
+  Math.round((Date.parse(mondayB) - Date.parse(mondayA)) / (7 * 86400000));
+const maxStreakWeeks = (s) =>
+  s.streakStep > 0 ? Math.ceil(s.streakMax / s.streakStep - 1e-9) : 0;
+
+// Streaken slik den står i dag. Hver hele uke uten oppmøte tar den ned ett trinn.
+function effectiveStreak(profile, today, s) {
+  if (!profile?.lastStreakMonday) return 0;
+  const base = Math.min(profile.attendanceStreak ?? 0, maxStreakWeeks(s));
+  const gap = weeksBetween(profile.lastStreakMonday, mondayOf(today));
+  return gap <= 1 ? base : Math.max(0, base - (gap - 1));
+}
+
+function multiplierFor(streak, s, extra = 0) {
+  const m = 1 + Math.min(streak * s.streakStep, s.streakMax) + extra; // bonuser summeres
+  return Math.min(s.multiplierCap, Math.round(m * 100) / 100);
+}
+
+// Regner ut multiplikator og endelige poeng, og evt. ny streak. Låses i det poengene deles ut.
+async function computeAward(userId, base, { attendance }) {
+  const [profile, settings] = await Promise.all([
+    getItem(userKey(userId)),
+    loadSettings(),
+  ]);
+  const today = todayOslo();
+  let streak = effectiveStreak(profile, today, settings);
+  let streakUpdate;
+  if (attendance) {
+    const thisMonday = mondayOf(today);
+    if (profile?.lastStreakMonday !== thisMonday) {
+      streak = Math.min(maxStreakWeeks(settings), streak + 1);
+      streakUpdate = {
+        value: streak,
+        week: isoWeekKey(today),
+        monday: thisMonday,
+      };
+    }
+  }
+  const multiplier = multiplierFor(streak, settings);
+  return {
+    basePoints: base,
+    multiplier,
+    delta: Math.round(base * multiplier),
+    streakUpdate,
+    streak,
+  };
+}
+
+const awardNote = (a) =>
+  a.multiplier > 1
+    ? ` (${a.basePoints} × ${fmtMult(a.multiplier)}, streak ${a.streak} uke${a.streak === 1 ? "" : "r"})`
+    : "";
+
+// Oppdaterer nivå og Discord-roller etter poengendring. Kalles best effort.
+async function syncLevel(userId) {
+  const [profile, settings] = await Promise.all([
+    getItem(userKey(userId)),
+    loadSettings(),
+  ]);
+  if (!profile) return null;
+  const level = levelFor(profile.totalEarned ?? 0, settings);
+  if (profile.level === level.key) return null;
+
+  try {
+    await db.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: userKey(userId),
+        UpdateExpression: "SET #lv = :l",
+        ConditionExpression: "attribute_not_exists(#lv) OR #lv <> :l",
+        ExpressionAttributeNames: { "#lv": "level" },
+        ExpressionAttributeValues: { ":l": level.key },
+      }),
+    );
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return null;
+    throw err;
+  }
+
+  const guild = process.env.GUILD_ID;
+  if (guild) {
+    const newRole = settings[level.role];
+    const oldLevel = LEVELS[levelRank(profile.level)];
+    const oldRole = oldLevel ? settings[oldLevel.role] : null;
+    if (newRole)
+      await discord(`/guilds/${guild}/members/${userId}/roles/${newRole}`, {
+        method: "PUT",
+      }).catch((e) => console.warn("Kunne ikke gi rolle:", e.message));
+    if (oldRole && oldRole !== newRole)
+      await discord(`/guilds/${guild}/members/${userId}/roles/${oldRole}`, {
+        method: "DELETE",
+      }).catch((e) => console.warn("Kunne ikke fjerne rolle:", e.message));
+  }
+
+  const rose = levelRank(level.key) > levelRank(profile.level ?? "recruit");
+  if (rose && (profile.level || level.key !== "recruit")) {
+    await tryDM(userId, {
+      content: `🎉 Du har nådd nivået **${level.name}**! Takk for alt du bidrar med 💙`,
+    });
+  }
+  return level;
+}
+
+/* ============================================================
+ * Fase 3: bilder til bildekanal
+ * ============================================================ */
+
+async function publishPhoto(photoUrl, task, settings) {
+  let url = photoUrl;
+  try {
+    // Discord-lenker utløper, så be om en fersk
+    const r = await discord("/attachments/refresh-urls", {
+      method: "POST",
+      body: { attachment_urls: [photoUrl] },
+    });
+    url = r.refreshed_urls?.[0]?.refreshed ?? photoUrl;
+  } catch (err) {
+    console.warn("refresh-urls feilet, bruker original-URL:", err.message);
+  }
+  const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+  if (!res.ok) throw new Error(`Kunne ikke hente bildet (${res.status})`);
+  const type = (res.headers.get("content-type") ?? "image/jpeg").split(";")[0];
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > 8 * 1024 * 1024)
+    throw new Error("Bildet er for stort til å poste på nytt");
+  const filename = `oppgave.${type.split("/")[1] ?? "jpg"}`;
+
+  const form = new FormData();
+  form.append(
+    "payload_json",
+    JSON.stringify({
+      content: `✨ **${task.title}** er gjort! Takk for hjelpen 💙`,
+      attachments: [{ id: 0, filename }],
+      allowed_mentions: { parse: [] },
+    }),
+  );
+  form.append("files[0]", new Blob([buf], { type }), filename);
+  await discord(`/channels/${settings.photoChannelId}/messages`, {
+    method: "POST",
+    form,
+  });
+  return true;
+}
+
+// Alt som skjer etter at en ferdigmelding er godkjent (parallelt, innen tidsramme)
+async function afterApproval(r, targetId) {
+  const settings = await loadSettings();
+  const wantsPhoto = Boolean(r.photoUrl && settings.photoChannelId);
+  const [, , photoOk] = await Promise.all([
+    withTimeout(
+      tryDM(targetId, {
+        content: `🎉 **${r.task.title}** er godkjent! Du fikk ${r.award.delta} poeng${awardNote(r.award)}. Takk for innsatsen!`,
+      }),
+      1800,
+    ),
+    withTimeout(syncLevel(targetId), 1800),
+    wantsPhoto
+      ? withTimeout(publishPhoto(r.photoUrl, r.task, settings), 2200, false)
+      : null,
+  ]);
+  return { wantsPhoto, photoOk: Boolean(photoOk) };
+}
+
+/* ============================================================
+ * Fase 3: /takk
+ * ============================================================ */
+
+async function cmdTakk(i, opts, userId) {
+  const target = opts.bruker;
+  if (target === userId)
+    return ephemeral(
+      "Takk til deg selv også 😄 men her deler vi ut til andre. Prøv en annen!",
+    );
+  if (i.data.resolved?.users?.[target]?.bot)
+    return ephemeral("Boter trenger ingen poeng 🤖");
+
+  const settings = await loadSettings();
+  const week = isoWeekKey(todayOslo());
+  const award = await computeAward(target, settings.thanksPoints, {
+    attendance: false,
+  });
+  const r = await transact([
+    {
+      Update: {
+        TableName: TABLE,
+        Key: { PK: `USER#${userId}`, SK: `THANKS#${week}` },
+        UpdateExpression: "ADD #n :one",
+        ConditionExpression: "attribute_not_exists(#n) OR #n < :max",
+        ExpressionAttributeNames: { "#n": "count" },
+        ExpressionAttributeValues: {
+          ":one": 1,
+          ":max": settings.thanksMaxPerWeek,
+        },
+      },
+    },
+    {
+      Put: {
+        TableName: TABLE,
+        Item: {
+          PK: `USER#${userId}`,
+          SK: `THANKED#${week}#${target}`,
+          entity: "THANKED",
+          createdAt: now(),
+        },
+        ConditionExpression: "attribute_not_exists(PK)",
+      },
+    },
+    ...pointsOps({
+      userId: target,
+      delta: award.delta,
+      basePoints: award.basePoints,
+      multiplier: award.multiplier,
+      reason: `Takk fra <@${userId}>`,
+      givenBy: userId,
+    }),
+  ]);
+  if (!r.ok) {
+    if (failedAt(r, 0))
+      return ephemeral(
+        `Du har brukt opp ukens takk (maks ${settings.thanksMaxPerWeek} per uke). Neste uke er det nye 💙`,
+      );
+    if (failedAt(r, 1))
+      return ephemeral("Du har allerede takket den personen denne uken 🙂");
+    return ephemeral("Noe skjedde samtidig. Prøv igjen om litt 🙂");
+  }
+  await withTimeout(syncLevel(target), 1500);
+  const melding = opts.melding ? `\n> ${opts.melding}` : "";
+  return message({
+    content: `💙 <@${userId}> sier takk til <@${target}>!${melding}`,
+    allowed_mentions: { users: [target] },
+  });
+}
+
+/* ============================================================
+ * Fase 3: ideboks (anonym)
+ * ============================================================ */
+
+async function cmdIde(i, opts, userId) {
+  const settings = await loadSettings();
+  if (!settings.adminChannelId)
+    return ephemeral(
+      "Admin-kanalen er ikke satt opp ennå. Be en admin bruke `/innstillinger`.",
+    );
+  const id = randomBytes(4).toString("hex");
+  await db.send(
+    new PutCommand({
+      TableName: TABLE,
+      Item: {
+        PK: `IDEA#${id}`,
+        SK: "META",
+        entity: "IDEA",
+        id,
+        userId, // lagres internt, vises aldri i meldingen til admin
+        text: opts.tekst,
+        status: "new",
+        createdAt: now(),
+      },
+      ConditionExpression: "attribute_not_exists(PK)",
+    }),
+  );
+  try {
+    await postToChannel(settings.adminChannelId, {
+      content: "💡 Ny anonym idé",
+      allowed_mentions: { parse: [] },
+      embeds: [{ description: opts.tekst, color: 0xfee75c }],
+      components: [
+        {
+          type: 1,
+          components: [
+            button(3, "✅ Tatt i bruk", `idea_use:${id}`),
+            button(2, "📁 Arkiver", `idea_arch:${id}`),
+          ],
+        },
+      ],
+    });
+  } catch (err) {
+    console.error("Kunne ikke poste idé", err);
+    await db
+      .send(
+        new DeleteCommand({
+          TableName: TABLE,
+          Key: { PK: `IDEA#${id}`, SK: "META" },
+        }),
+      )
+      .catch(() => {});
+    return ephemeral(
+      "Jeg klarte ikke å sende ideen akkurat nå. Prøv igjen om litt 🙏",
+    );
+  }
+  return ephemeral(
+    "💡 Takk for ideen! Den er sendt anonymt. Admin ser ikke at den er fra deg, men hvis den tas i bruk, får du poengene automatisk.",
+  );
+}
+
+async function ideaOpenModal(ideaId) {
+  const settings = await loadSettings();
+  return json({
+    type: 9,
+    data: {
+      custom_id: `idea_use_modal:${ideaId}`,
+      title: "Idé tatt i bruk",
+      components: [
+        textInputRow("points", "Poeng til avsender", {
+          required: true,
+          max_length: 5,
+          value: String(settings.ideaPoints),
+        }),
+      ],
+    },
+  });
+}
+
+async function ideaUse(i, ideaId) {
+  if (!canManage(i)) return ephemeral(NO_ACCESS);
+  const raw = modalValue(i, "points");
+  if (!/^\d{1,5}$/.test(raw))
+    return ephemeral(
+      "Poeng må være et helt tall. Trykk «Tatt i bruk» og prøv igjen.",
+    );
+  const idea = await getItem({ PK: `IDEA#${ideaId}`, SK: "META" });
+  if (!idea) return ephemeral("Fant ikke ideen.");
+  const reviewer = userOf(i).id;
+  const award = await computeAward(idea.userId, Number(raw), {
+    attendance: false,
+  });
+  const r = await transact([
+    {
+      Update: {
+        TableName: TABLE,
+        Key: { PK: `IDEA#${ideaId}`, SK: "META" },
+        UpdateExpression: "SET #st = :u, reviewedBy = :by, reviewedAt = :ts",
+        ConditionExpression: "#st = :n",
+        ExpressionAttributeNames: { "#st": "status" },
+        ExpressionAttributeValues: {
+          ":u": "used",
+          ":n": "new",
+          ":by": reviewer,
+          ":ts": now(),
+        },
+      },
+    },
+    ...pointsOps({
+      userId: idea.userId,
+      delta: award.delta,
+      basePoints: award.basePoints,
+      multiplier: award.multiplier,
+      reason: "Idé tatt i bruk",
+      givenBy: reviewer,
+    }),
+  ]);
+  if (!r.ok) return ephemeral("Denne ideen er allerede behandlet.");
+  await Promise.all([
+    withTimeout(
+      tryDM(idea.userId, {
+        content: `💡 Ideen din ble tatt i bruk! Du fikk ${award.delta} poeng${awardNote(award)}. Tusen takk!\n> ${idea.text.slice(0, 200)}`,
+      }),
+      1800,
+    ),
+    withTimeout(syncLevel(idea.userId), 1800),
+  ]);
+  return updateMessage({
+    content: `✅ Tatt i bruk (godkjent av <@${reviewer}>). Avsender er belønnet.`,
+    embeds: i.message?.embeds ?? [],
+    components: [],
+  });
+}
+
+async function ideaArchive(i, ideaId) {
+  if (!canManage(i)) return ephemeral(NO_ACCESS);
+  try {
+    await db.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { PK: `IDEA#${ideaId}`, SK: "META" },
+        UpdateExpression: "SET #st = :a, reviewedBy = :by, reviewedAt = :ts",
+        ConditionExpression: "#st = :n",
+        ExpressionAttributeNames: { "#st": "status" },
+        ExpressionAttributeValues: {
+          ":a": "archived",
+          ":n": "new",
+          ":by": userOf(i).id,
+          ":ts": now(),
+        },
+      }),
+    );
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException")
+      return ephemeral("Denne ideen er allerede behandlet.");
+    throw err;
+  }
+  return updateMessage({
+    content: `📁 Arkivert av <@${userOf(i).id}>`,
+    embeds: i.message?.embeds ?? [],
+    components: [],
+  });
+}
+
+/* ============================================================
+ * Fase 3: ny ordinær besøkende (/ny-gjest)
+ * ============================================================ */
+
+async function cmdNyGjest(i, opts, userId) {
+  const settings = await loadSettings();
+  if (!settings.adminChannelId)
+    return ephemeral(
+      "Admin-kanalen er ikke satt opp ennå. Be en admin bruke `/innstillinger`.",
+    );
+  const week = isoWeekKey(todayOslo());
+  const id = randomBytes(4).toString("hex");
+  const r = await transact([
+    {
+      Update: {
+        TableName: TABLE,
+        Key: { PK: `USER#${userId}`, SK: `GUESTREQ#${week}` },
+        UpdateExpression: "ADD #n :one",
+        ConditionExpression: "attribute_not_exists(#n) OR #n < :max",
+        ExpressionAttributeNames: { "#n": "count" },
+        ExpressionAttributeValues: {
+          ":one": 1,
+          ":max": settings.guestMaxPerWeek,
+        },
+      },
+    },
+    {
+      Put: {
+        TableName: TABLE,
+        Item: {
+          PK: `GUEST#${id}`,
+          SK: "META",
+          entity: "GUEST",
+          id,
+          userId,
+          note: opts.merknad, // slettes når admin har tatt stilling
+          status: "pending",
+          createdAt: now(),
+        },
+        ConditionExpression: "attribute_not_exists(PK)",
+      },
+    },
+  ]);
+  if (!r.ok)
+    return ephemeral(
+      `Du har allerede meldt ${settings.guestMaxPerWeek} gjester denne uka. Prøv igjen neste uke 🙂`,
+    );
+
+  try {
+    await postToChannel(settings.adminChannelId, {
+      content:
+        `🎮 <@${userId}> melder at de har tatt med en ny besøkende.` +
+        (opts.merknad ? `\nMerknad: ${opts.merknad}` : "") +
+        `\nBekreft bare hvis personen faktisk møtte opp.`,
+      allowed_mentions: { parse: [] },
+      components: [
+        {
+          type: 1,
+          components: [
+            button(3, "✅ Bekreft at gjesten møtte opp", `guest_ok:${id}`),
+            button(4, "❌ Avslå", `guest_no:${id}`),
+          ],
+        },
+      ],
+    });
+  } catch (err) {
+    console.error("Kunne ikke poste ny-gjest", err);
+    await db
+      .send(
+        new DeleteCommand({
+          TableName: TABLE,
+          Key: { PK: `GUEST#${id}`, SK: "META" },
+        }),
+      )
+      .catch(() => {});
+    await db
+      .send(
+        new UpdateCommand({
+          TableName: TABLE,
+          Key: { PK: `USER#${userId}`, SK: `GUESTREQ#${week}` },
+          UpdateExpression: "ADD #n :m",
+          ExpressionAttributeNames: { "#n": "count" },
+          ExpressionAttributeValues: { ":m": -1 },
+        }),
+      )
+      .catch(() => {});
+    return ephemeral(
+      "Jeg klarte ikke å sende meldingen akkurat nå. Prøv igjen om litt 🙏",
+    );
+  }
+  return ephemeral(
+    "🎮 Takk! En admin eller leder bekrefter at gjesten var her, og så får du poengene.",
+  );
+}
+
+async function guestConfirm(i, guestId) {
+  if (!canManage(i)) return ephemeral(NO_ACCESS);
+  const guest = await getItem({ PK: `GUEST#${guestId}`, SK: "META" });
+  if (!guest) return ephemeral("Fant ikke meldingen.");
+  const reviewer = userOf(i).id;
+  if (guest.userId === reviewer && !isAdmin(i))
+    return ephemeral("Du kan ikke bekrefte din egen gjest 🙂");
+  const settings = await loadSettings();
+  const award = await computeAward(guest.userId, settings.guestPoints, {
+    attendance: false,
+  });
+  const r = await transact([
+    {
+      Update: {
+        TableName: TABLE,
+        Key: { PK: `GUEST#${guestId}`, SK: "META" },
+        UpdateExpression:
+          "SET #st = :c, reviewedBy = :by, reviewedAt = :ts REMOVE #nt",
+        ConditionExpression: "#st = :p",
+        ExpressionAttributeNames: { "#st": "status", "#nt": "note" },
+        ExpressionAttributeValues: {
+          ":c": "confirmed",
+          ":p": "pending",
+          ":by": reviewer,
+          ":ts": now(),
+        },
+      },
+    },
+    ...pointsOps({
+      userId: guest.userId,
+      delta: award.delta,
+      basePoints: award.basePoints,
+      multiplier: award.multiplier,
+      reason: "Tok med ny besøkende",
+      givenBy: reviewer,
+    }),
+  ]);
+  if (!r.ok) return ephemeral("Dette er allerede behandlet.");
+  await Promise.all([
+    withTimeout(
+      tryDM(guest.userId, {
+        content: `🎮 Gjesten din er bekreftet! Du fikk ${award.delta} poeng${awardNote(award)}. Takk for at du tar med nye folk 💙`,
+      }),
+      1800,
+    ),
+    withTimeout(syncLevel(guest.userId), 1800),
+  ]);
+  return updateMessage({
+    content: `✅ Bekreftet av <@${reviewer}> · <@${guest.userId}> fikk ${award.delta} poeng`,
+    components: [],
+  });
+}
+
+async function guestReject(i, guestId) {
+  if (!canManage(i)) return ephemeral(NO_ACCESS);
+  const guest = await getItem({ PK: `GUEST#${guestId}`, SK: "META" });
+  if (!guest) return ephemeral("Fant ikke meldingen.");
+  const reviewer = userOf(i).id;
+  const r = await transact([
+    {
+      Update: {
+        TableName: TABLE,
+        Key: { PK: `GUEST#${guestId}`, SK: "META" },
+        UpdateExpression:
+          "SET #st = :r, reviewedBy = :by, reviewedAt = :ts REMOVE #nt",
+        ConditionExpression: "#st = :p",
+        ExpressionAttributeNames: { "#st": "status", "#nt": "note" },
+        ExpressionAttributeValues: {
+          ":r": "rejected",
+          ":p": "pending",
+          ":by": reviewer,
+          ":ts": now(),
+        },
+      },
+    },
+  ]);
+  if (!r.ok) return ephemeral("Dette er allerede behandlet.");
+  await withTimeout(
+    tryDM(guest.userId, {
+      content:
+        "Vi fikk ikke bekreftet gjesten denne gangen. Si fra til en leder hvis du mener det er en feil 🙂",
+    }),
+    1800,
+  );
+  return updateMessage({
+    content: `❌ Avslått av <@${reviewer}>`,
+    components: [],
+  });
+}
+
+/* ============================================================
+ * Fase 3: /leaderboard og månedens frivillige
+ * ============================================================ */
+
+async function cmdLeaderboard() {
+  const settings = await loadSettings();
+  if (!settings.leaderboardEnabled)
+    return ephemeral("Topplisten er ikke slått på akkurat nå 🙂");
+  const key = todayOslo().slice(0, 7);
+  const rows = (
+    await queryAll({
+      KeyConditionExpression: "PK = :p",
+      ExpressionAttributeValues: { ":p": `MONTH#${key}` },
+    })
+  )
+    .filter((r) => (r.earned ?? 0) > 0)
+    .sort((a, b) => b.earned - a.earned)
+    .slice(0, 5);
+  const [, m] = key.split("-");
+  if (!rows.length)
+    return ephemeral(
+      `Ingen poeng er delt ut i ${MONTHS[Number(m) - 1]} ennå. Det er god plass! 🙂`,
+    );
+  return message({
+    embeds: [
+      {
+        title: `Aktive i ${MONTHS[Number(m) - 1]}`,
+        description: rows
+          .map((r) => `🌟 <@${r.userId}> · ${r.earned} poeng`)
+          .join("\n"),
+        color: 0x5865f2,
+        footer: { text: "Alle bidrag teller, store som små 💙" },
+      },
+    ],
+  });
+}
+
+async function runMonthly() {
+  const today = todayOslo();
+  const [y, m] = today.split("-").map(Number);
+  const py = m === 1 ? y - 1 : y;
+  const pm = m === 1 ? 12 : m - 1;
+  const key = `${py}-${pad(pm)}`;
+
+  const settings = await loadSettings();
+  const channel =
+    settings.shoutoutChannelId ||
+    settings.summaryChannelId ||
+    settings.adminChannelId;
+  if (!channel) return { skipped: "ingen kanal satt" };
+  if (!(await claimJob("monthly", key))) return { skipped: "kjørte allerede" };
+
+  try {
+    const rows = (
+      await queryAll({
+        KeyConditionExpression: "PK = :p",
+        ExpressionAttributeValues: { ":p": `MONTH#${key}` },
+      })
+    ).filter((r) => (r.earned ?? 0) > 0);
+    if (!rows.length) return { winners: 0 };
+
+    const max = Math.max(...rows.map((r) => r.earned));
+    const winners = rows.filter((r) => r.earned === max).slice(0, 3);
+    const names = winners.map((w) => `<@${w.userId}>`).join(" og ");
+    await postToChannel(channel, {
+      embeds: [
+        {
+          title: `🏆 Månedens frivillige: ${MONTHS[pm - 1]}`,
+          description:
+            `Denne måneden bidro ${names} ekstra mye, med ${max} poeng. Tusen takk for innsatsen! 💙\n\n` +
+            `Og takk til dere andre også. Hver minste ting teller.`,
+          color: 0xfee75c,
+        },
+      ],
+      allowed_mentions: { parse: [] },
+    });
+    return { winners: winners.length };
+  } catch (err) {
+    await releaseJob("monthly");
+    throw err;
+  }
 }
 
 /* ============================================================
