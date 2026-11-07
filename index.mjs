@@ -66,6 +66,7 @@ const DEFAULT_SETTINGS = {
   // Toppliste og kanaler
   leaderboardEnabled: 0, // 1 = på
   photoChannelId: process.env.PHOTO_CHANNEL_ID ?? null,
+  photoMaxMb: 9.5, // største bilde boten laster opp på nytt (Discord: ca. 10 uten serverboost)
   shoutoutChannelId: process.env.SHOUTOUT_CHANNEL_ID ?? null,
 };
 
@@ -175,6 +176,12 @@ const SETTING_DEFS = {
     label: "Toppliste (1 = på, 0 = av)",
   },
   photoChannelId: { type: "id", label: "Bildekanal (#før-og-etter)" },
+  photoMaxMb: {
+    type: "float",
+    min: 1,
+    max: 100,
+    label: "Bilde: maks størrelse i MB (ca. 10 uten serverboost)",
+  },
   shoutoutChannelId: { type: "id", label: "Kanal for månedens frivillige" },
 };
 
@@ -892,6 +899,9 @@ async function cmdFerdig(i, opts, userId) {
           taskId,
           userId,
           photoUrl,
+          photoWidth: attachment?.width,
+          photoHeight: attachment?.height,
+          photoSize: attachment?.size,
           status: "pending",
           submittedAt: ts,
         },
@@ -1043,7 +1053,17 @@ async function approveCompletion(taskId, userId, reviewerId) {
       if (e.name !== "ConditionalCheckFailedException") throw e;
     });
 
-  return { ok: true, task, award, photoUrl: completion.photoUrl };
+  return {
+    ok: true,
+    task,
+    award,
+    photoUrl: completion.photoUrl,
+    photoMeta: {
+      width: completion.photoWidth,
+      height: completion.photoHeight,
+      size: completion.photoSize,
+    },
+  };
 }
 
 async function rejectCompletion(taskId, userId, reviewerId, comment) {
@@ -1593,7 +1613,9 @@ async function handleComponent(i) {
         ? after.queued
           ? " · 📸 bilde sendes til bildekanalen"
           : " · ⚠️ bildet ble ikke publisert (bakgrunnsjobb mangler, se oppsett)"
-        : "";
+        : after.noChannel
+          ? " · ℹ️ bildet ble ikke publisert fordi bildekanalen ikke er satt (/innstillinger)"
+          : "";
       return updateMessage({
         content: `✅ Godkjent av <@${user.id}> · <@${targetId}> fikk ${r.award.delta} poeng for **${r.task.title}**${awardNote(r.award)}${photoNote}`,
         embeds: i.message?.embeds ?? [],
@@ -2770,7 +2792,9 @@ async function syncLevel(userId) {
  * Fase 3: bilder til bildekanal
  * ============================================================ */
 
-async function publishPhoto(photoUrl, task, settings) {
+async function publishPhoto(photoUrl, task, settings, meta = {}) {
+  const maxBytes = (settings.photoMaxMb ?? 9.5) * 1024 * 1024;
+
   let url = photoUrl;
   try {
     // Discord-lenker utløper, så be om en fersk
@@ -2782,14 +2806,45 @@ async function publishPhoto(photoUrl, task, settings) {
   } catch (err) {
     console.warn("refresh-urls feilet, bruker original-URL:", err.message);
   }
-  const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
-  if (!res.ok) throw new Error(`Kunne ikke hente bildet (${res.status})`);
-  const type = (res.headers.get("content-type") ?? "image/jpeg").split(";")[0];
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length > 9.5 * 1024 * 1024)
-    throw new Error("Bildet er for stort (over ca. 9,5 MB)");
-  const filename = `oppgave.${type.split("/")[1] ?? "jpg"}`;
 
+  // Samme (signerte) lenke via Discords media-proxy, skalert ned til maks 2560 px på lengste side
+  const resizedUrl = (u) => {
+    const x = new URL(u);
+    if (x.hostname === "cdn.discordapp.com")
+      x.hostname = "media.discordapp.net";
+    const { width: w, height: h } = meta;
+    const scale = w && h ? Math.min(1, 2560 / Math.max(w, h)) : null;
+    x.searchParams.set("width", String(scale ? Math.round(w * scale) : 2560));
+    x.searchParams.set("height", String(scale ? Math.round(h * scale) : 2560));
+    x.searchParams.set("format", "webp");
+    return x.toString();
+  };
+  const download = async (u) => {
+    const res = await fetch(u, { signal: AbortSignal.timeout(20000) });
+    if (!res.ok) throw new Error(`Kunne ikke hente bildet (${res.status})`);
+    return {
+      type: (res.headers.get("content-type") ?? "image/jpeg").split(";")[0],
+      buf: Buffer.from(await res.arrayBuffer()),
+    };
+  };
+
+  // Vet vi at originalen er for stor, hopper vi rett til den nedskalerte versjonen
+  let usedResized = Boolean(meta.size && meta.size > maxBytes);
+  let img = await download(usedResized ? resizedUrl(url) : url);
+  if (img.buf.length > maxBytes && !usedResized) {
+    usedResized = true;
+    img = await download(resizedUrl(url));
+  }
+  if (img.buf.length > maxBytes)
+    throw new Error(
+      `Bildet er for stort, også etter nedskalering (over ${settings.photoMaxMb ?? 9.5} MB)`,
+    );
+  if (usedResized)
+    console.log(
+      `Bildet ble skalert ned til ${Math.round(img.buf.length / 1024)} KB`,
+    );
+
+  const filename = `oppgave.${img.type.split("/")[1] ?? "jpg"}`;
   const form = new FormData();
   form.append(
     "payload_json",
@@ -2799,7 +2854,7 @@ async function publishPhoto(photoUrl, task, settings) {
       allowed_mentions: { parse: [] },
     }),
   );
-  form.append("files[0]", new Blob([buf], { type }), filename);
+  form.append("files[0]", new Blob([img.buf], { type: img.type }), filename);
   await discord(`/channels/${settings.photoChannelId}/messages`, {
     method: "POST",
     form,
@@ -2840,17 +2895,34 @@ async function afterApproval(r, targetId) {
     title: r.task.title,
     dm: `🎉 **${r.task.title}** er godkjent! Du fikk ${r.award.delta} poeng${awardNote(r.award)}. Takk for innsatsen!`,
     photoUrl: wantsPhoto ? r.photoUrl : undefined,
+    photoMeta: r.photoMeta,
+    photoMaxMb: settings.photoMaxMb,
     photoChannelId: settings.photoChannelId,
     adminChannelId: settings.adminChannelId,
   };
-  if (await dispatchAsync(payload)) return { wantsPhoto, queued: true };
+  const noChannel = Boolean(r.photoUrl && !settings.photoChannelId);
+  if (await dispatchAsync(payload))
+    return { wantsPhoto, noChannel, queued: true };
 
   // Reserve hvis bakgrunnsjobb ikke kunne startes: gjør det raske her, hopp over bildet
   await Promise.all([
     withTimeout(tryDM(targetId, { content: payload.dm }), 1200),
     withTimeout(syncLevel(targetId), 1200),
   ]);
-  return { wantsPhoto, queued: false };
+  return { wantsPhoto, noChannel, queued: false };
+}
+
+function photoErrorHint(err) {
+  const m = String(err.message);
+  if (/\b(403|50013|50001)\b/.test(m))
+    return "boten mangler tilgang i bildekanalen. Den trenger *Se kanal*, *Send meldinger* og *Legg ved filer* der.";
+  if (/\b404\b|\b410\b/.test(m) && /hente bildet/.test(m))
+    return "bildelenken fra Discord har utløpt eller er fjernet.";
+  if (/\b10003\b/.test(m) || /Unknown Channel/i.test(m))
+    return "bildekanalen finnes ikke. Sjekk kanal-ID-en i `/innstillinger`.";
+  if (/for stort/.test(m))
+    return "bildet er for stort til å poste på nytt, selv etter nedskalering. Be om et mindre bilde, eller øk `Bilde: maks størrelse` i `/innstillinger` hvis serveren har boost.";
+  return `${m.slice(0, 200)} (se CloudWatch-loggen for detaljer)`;
 }
 
 async function runAfterApproval(p) {
@@ -2865,13 +2937,16 @@ async function runAfterApproval(p) {
       await publishPhoto(
         p.photoUrl,
         { title: p.title },
-        { photoChannelId: p.photoChannelId },
+        { photoChannelId: p.photoChannelId, photoMaxMb: p.photoMaxMb },
+        p.photoMeta,
       );
     } catch (err) {
       console.error("Kunne ikke publisere bilde:", err);
       if (p.adminChannelId) {
         await postToChannel(p.adminChannelId, {
-          content: `⚠️ Bildet til **${p.title}** kunne ikke publiseres i bildekanalen (${err.message}). Poengene er delt ut som vanlig.`,
+          content:
+            `⚠️ Bildet til **${p.title}** kunne ikke publiseres i bildekanalen <#${p.photoChannelId}>. Poengene er delt ut som vanlig.\n` +
+            `Årsak: ${photoErrorHint(err)}`,
           allowed_mentions: { parse: [] },
         }).catch(() => {});
       }

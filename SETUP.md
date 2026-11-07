@@ -5,15 +5,17 @@
 **Tabellnavn:** `frivillig` (Lambdaen leser navnet fra `TABLE_NAME`)
 **Capacity:** On-demand
 
-| Nøkkel | Attributt | Type |
-| --- | --- | --- |
-| Partition key | `PK` | String |
-| Sort key | `SK` | String |
+| Nøkkel        | Attributt | Type   |
+| ------------- | --------- | ------ |
+| Partition key | `PK`      | String |
+| Sort key      | `SK`      | String |
 
 **GSI1** – oppgaver og innsjekk
+
 - Navn: `GSI1`, partition key `GSI1PK` (String), sort key `GSI1SK` (String), projection **All**
 
 **GSI2** – «mine ting»
+
 - Navn: `GSI2`, partition key `GSI2PK` (String), sort key `GSI2SK` (String), projection **All**
 
 (GSI-navnene må være nøyaktig `GSI1` og `GSI2`.) Den gamle prototype-tabellen (nøkkel `id`) kan ikke gjenbrukes.
@@ -44,6 +46,7 @@ Erstatt region/konto. Gir tilgang til kun denne tabellen og indeksene:
   ]
 }
 ```
+
 Transaksjoner (`TransactWriteItems`) krever ikke egne rettigheter utover Put/Update/Delete på elementene.
 
 **I tillegg: tillatelse til å starte seg selv i bakgrunnen.** Etter en godkjenning kjører botten bildepublisering, DM og nivåoppdatering som en bakgrunnsjobb, så knappen svarer innen Discords 3 sekunder. Legg til en ekstra statement i samme policy (erstatt region, konto og funksjonsnavn):
@@ -55,43 +58,44 @@ Transaksjoner (`TransactWriteItems`) krever ikke egne rettigheter utover Put/Upd
   "Resource": "arn:aws:lambda:eu-north-1:<KONTO-ID>:function:<LAMBDA-NAVN>"
 }
 ```
+
 Uten denne tillatelsen virker godkjenning og poeng som vanlig, men bildet blir ikke publisert i bildekanalen, og det står en advarsel i godkjenningsmeldingen. Pakken `@aws-sdk/client-lambda` følger med Node 22-runtimen i Lambda, så du trenger ikke legge den til i `package.json`.
 
 ## 3. Lambda
 
 - Runtime Node.js 22, handler `index.handler`
 - Timeout **60 s**, minne **256 MB** eller mer (bildepublisering og innsjekk-jobben kan bruke litt tid)
-- **Function URL**, auth type `NONE`. Lim URL-en inn som *Interactions Endpoint URL* i Discord Developer Portal.
+- **Function URL**, auth type `NONE`. Lim URL-en inn som _Interactions Endpoint URL_ i Discord Developer Portal.
 
 **Miljøvariabler**
 
-| Navn | Innhold |
-| --- | --- |
-| `TABLE_NAME` | `frivillig` |
-| `DISCORD_PUBLIC_KEY` | Public key fra Developer Portal |
-| `DISCORD_TOKEN` | Bot-token |
-| `ADMIN_ROLE_ID` | ID til admin-rollen |
-| `LEADER_ROLE_ID` | ID til rollen «Voksen leder» |
-| `ADMIN_CHANNEL_ID` | (valgfri) kanal for godkjenninger – kan i stedet settes med `/innstillinger` |
-| `FALLBACK_CHANNEL_ID` | (valgfri) reservekanal hvis DM er stengt |
-| `GUILD_ID` | Server-ID. **Påkrevd for nivå-roller** (boten gir og fjerner roller i denne serveren) |
-| `PHOTO_CHANNEL_ID` | (valgfri) bildekanalen, kan i stedet settes med `/innstillinger` |
-| `SHOUTOUT_CHANNEL_ID` | (valgfri) kanal for månedens frivillige, kan settes med `/innstillinger` |
-| `SUMMARY_CHANNEL_ID` | (valgfri) kanal for ukesoppsummering. Uten den brukes admin-kanalen |
+| Navn                  | Innhold                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------- |
+| `TABLE_NAME`          | `frivillig`                                                                           |
+| `DISCORD_PUBLIC_KEY`  | Public key fra Developer Portal                                                       |
+| `DISCORD_TOKEN`       | Bot-token                                                                             |
+| `ADMIN_ROLE_ID`       | ID til admin-rollen                                                                   |
+| `LEADER_ROLE_ID`      | ID til rollen «Voksen leder»                                                          |
+| `ADMIN_CHANNEL_ID`    | (valgfri) kanal for godkjenninger – kan i stedet settes med `/innstillinger`          |
+| `FALLBACK_CHANNEL_ID` | (valgfri) reservekanal hvis DM er stengt                                              |
+| `GUILD_ID`            | Server-ID. **Påkrevd for nivå-roller** (boten gir og fjerner roller i denne serveren) |
+| `PHOTO_CHANNEL_ID`    | (valgfri) bildekanalen, kan i stedet settes med `/innstillinger`                      |
+| `SHOUTOUT_CHANNEL_ID` | (valgfri) kanal for månedens frivillige, kan settes med `/innstillinger`              |
+| `SUMMARY_CHANNEL_ID`  | (valgfri) kanal for ukesoppsummering. Uten den brukes admin-kanalen                   |
 
 Brukere med Discord-tillatelsen **Administrator** regnes også som admin.
 
-Botten trenger tillatelsene *Send Messages* og *Embed Links* i admin-kanalen, i oppsummeringskanalen og i kanalene der `/møte` brukes (møtemeldingen postes av botten).
+Botten trenger tillatelsene _Send Messages_ og _Embed Links_ i admin-kanalen, i oppsummeringskanalen og i kanalene der `/møte` brukes (møtemeldingen postes av botten).
 
 ## 4. EventBridge (fire planlagte jobber)
 
 Opprett fire schedules i EventBridge Scheduler, alle med Lambdaen som target og **konstant input**. Sett tidssone **Europe/Oslo** på de tre siste.
 
-| Navn | Schedule | Input |
-| --- | --- | --- |
-| `frivillig-checkin` | `rate(1 hour)` | `{ "job": "checkin" }` |
-| `frivillig-nightly` | `cron(0 3 * * ? *)` (hver natt kl. 03:00) | `{ "job": "nightly" }` |
-| `frivillig-weekly` | `cron(0 8 ? * MON *)` (mandag kl. 08:00) | `{ "job": "weekly" }` |
+| Navn                | Schedule                                          | Input                  |
+| ------------------- | ------------------------------------------------- | ---------------------- |
+| `frivillig-checkin` | `rate(1 hour)`                                    | `{ "job": "checkin" }` |
+| `frivillig-nightly` | `cron(0 3 * * ? *)` (hver natt kl. 03:00)         | `{ "job": "nightly" }` |
+| `frivillig-weekly`  | `cron(0 8 ? * MON *)` (mandag kl. 08:00)          | `{ "job": "weekly" }`  |
 | `frivillig-monthly` | `cron(0 9 1 * ? *)` (den 1. hver måned kl. 09:00) | `{ "job": "monthly" }` |
 
 - `nightly` oppretter oppgaver fra maler og varsler admin om oppgaver ingen har tatt.
@@ -115,6 +119,7 @@ Opprett fire schedules i EventBridge Scheduler, alle med Lambdaen som target og 
 ## Fase 2: slik fungerer det
 
 **Maler** (`/mal-ny`, `/mal-liste`, `/mal-slett`)
+
 - Intervall: ukentlig (dag 1–7, 1 = mandag), månedlig eller kvartalsvis (dag 1–28 i første måned i kvartalet).
 - Nattjobben legger ut oppgaven når perioden har startet, og bare én gang per periode. Lager du en mal midt i en periode, legges oppgaven ut med en gang hvis dagen allerede har passert.
 - Når en ny oppgave åpnes, fjernes forrige periodes oppgave **hvis ingen hadde tatt den**. Oppgaver noen har meldt seg på, blir liggende.
@@ -122,24 +127,29 @@ Opprett fire schedules i EventBridge Scheduler, alle med Lambdaen som target og 
 - Rotasjon er ikke innført (felt `rotation: "none"` ligger klart i malen).
 
 **Møter** (`/møte`)
+
 - Tidspunkt oppgis i norsk tid. Møtemeldingen har knappene Meld meg på / Meld meg av / Jeg er her.
 - «Jeg er her» virker bare for påmeldte, fra 15 min før start til 3 timer etter start (justerbart i `/innstillinger`), og gir poeng én gang.
 
 **Forslag** (`/foreslå`)
+
 - Går til admin-kanalen. Ved godkjenning fyller admin inn størrelse (og eventuelt poeng og plasser) i et skjema, og oppgaven publiseres. Forslagsstilleren får DM.
 
 **Ukesoppsummering**
+
 - Teller oppgaver godkjent forrige kalenderuke. Oppgaver godkjent før fase 2 ble tatt i bruk, er ikke med i tallene.
 
 ## Fase 3: slik fungerer det
 
 **Nivåer og roller**
+
 - Nivå beregnes av `totalEarned`: Rekrutt (start), Veteran og Legende. Grensene settes i `/innstillinger` (plassholdere: 100 og 500).
 - For automatiske Discord-roller: lag tre roller, sett IDene i `/innstillinger` (Discord-rolle: Rekrutt/Veteran/Legende), og sett `GUILD_ID` på Lambdaen.
 - Botten trenger tillatelsen **Manage Roles**, og botens egen rolle må ligge **over** nivårollene i rollelisten (Serverinnstillinger → Roller, dra den opp).
 - Nivået oppdateres når poeng endres. Endrer du grensene, oppdateres folk første gang de får poeng etterpå.
 
 **Streak og multiplikator**
+
 - En streak-uke teller når personen har en **godkjent oppgave** eller en **møteinnsjekk** den uken (uka starter mandag, tidssone Oslo).
 - +0,1 per uke på rad, maks +0,5 og maks ×1,5 totalt. Hver hele uke uten oppmøte tar streaken ned **ett trinn** (den nullstilles ikke).
 - Multiplikatoren gjelder **alle poeng** som deles ut automatisk: oppgaver, møter, takk, ideer og ny-gjest. Manuelle justeringer med `/poeng-juster` ganges ikke.
@@ -154,7 +164,7 @@ Opprett fire schedules i EventBridge Scheduler, alle med Lambdaen som target og 
 
 **Månedens frivillige:** `monthly`-jobben henter månedens poeng og poster en shoutout (ved likt poengtall nevnes opptil tre). `/leaderboard` er **av som standard**; slå den på med `/innstillinger innstilling:Toppliste verdi:1`.
 
-**Bildekanal:** sett «Bildekanal» i `/innstillinger`. Ved godkjenning lastes bildet ned og postes på nytt i kanalen (uten navn), siden Discord-lenker utløper. Botten trenger *Attach Files* i bildekanalen. Dette skjer i en bakgrunnsjobb (se IAM over), så godkjenningen svarer med en gang selv om bildet er stort. Bilder over ca. 9,5 MB kan ikke postes på nytt. Hvis det feiler, får admin-kanalen en advarsel, og poengene er likevel delt ut.
+**Bildekanal:** sett «Bildekanal» i `/innstillinger`. Ved godkjenning lastes bildet ned og postes på nytt i kanalen (uten navn), siden Discord-lenker utløper. Botten trenger _Attach Files_ i bildekanalen. Dette skjer i en bakgrunnsjobb (se IAM over), så godkjenningen svarer med en gang selv om bildet er stort. Er originalen over grensen, ber botten Discord om en nedskalert versjon (maks 2560 px på lengste side, som WebP) og poster den i stedet. Grensen er innstillingen «Bilde: maks størrelse i MB» (standard 9,5, siden en server uten boost tar imot ca. 10 MB). Har serveren boost, kan du øke den. Hvis det feiler, får admin-kanalen en advarsel, og poengene er likevel delt ut.
 
 **Innstillinger:** det er nå mange, så `innstilling` bruker autocomplete. Skriv f.eks. «poeng» eller «streak» for å finne dem.
 
