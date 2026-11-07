@@ -69,7 +69,7 @@ const commands = [
     ],
   },
   {
-    name: "idé",
+    name: "ide",
     description: "Send inn en anonym idé",
     options: [
       {
