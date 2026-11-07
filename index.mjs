@@ -247,7 +247,7 @@ const canManage = (i) => isAdmin(i) || isLeader(i);
 
 async function discord(
   path,
-  { method = "GET", body, form, retry = true } = {},
+  { method = "GET", body, form, retry = true, timeout = 5000 } = {},
 ) {
   const res = await fetch(`${DISCORD_API}${path}`, {
     method,
@@ -256,12 +256,12 @@ async function discord(
       ...(form ? {} : { "Content-Type": "application/json" }),
     },
     body: form ?? (body ? JSON.stringify(body) : undefined),
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(timeout),
   });
   if (res.status === 429 && retry) {
     const { retry_after = 1 } = await res.json().catch(() => ({}));
     await new Promise((r) => setTimeout(r, Math.min(retry_after, 5) * 1000));
-    return discord(path, { method, body, form, retry: false });
+    return discord(path, { method, body, form, retry: false, timeout });
   }
   if (!res.ok) {
     const text = await res.text();
@@ -1024,7 +1024,8 @@ async function approveCompletion(taskId, userId, reviewerId) {
   );
 
   const r = await transact(items);
-  if (!r.ok) return { ok: false, text: "Denne er allerede behandlet." };
+  if (!r.ok)
+    return { ok: false, handled: true, text: "Denne er allerede behandlet." };
 
   // Lukk oppgaven når alle plasser er fullført
   await db
@@ -1069,7 +1070,8 @@ async function rejectCompletion(taskId, userId, reviewerId, comment) {
     },
     signupUpdate(taskId, userId, ["submitted"], "active", { rejectedAt: ts }),
   ]);
-  if (!r.ok) return { ok: false, text: "Denne er allerede behandlet." };
+  if (!r.ok)
+    return { ok: false, handled: true, text: "Denne er allerede behandlet." };
   return { ok: true, task };
 }
 
@@ -1155,7 +1157,7 @@ async function runCheckins() {
   return { due: due.length, sent };
 }
 
-async function runJob(job) {
+async function runJob(job, event = {}) {
   switch (job) {
     case "checkin":
       return runCheckins();
@@ -1165,6 +1167,8 @@ async function runJob(job) {
       return runWeekly();
     case "monthly":
       return runMonthly();
+    case "afterApproval":
+      return runAfterApproval(event);
     default:
       console.log("Ukjent eller ikke-implementert jobb:", job);
       return { skipped: job };
@@ -1574,12 +1578,21 @@ async function handleComponent(i) {
       if (targetId === user.id && !isAdmin(i))
         return ephemeral("Du kan ikke godkjenne din egen ferdigmelding 🙂");
       const r = await approveCompletion(taskId, targetId, user.id);
-      if (!r.ok) return ephemeral(r.text);
+      if (!r.ok) {
+        // Allerede behandlet: fjern knappene så meldingen ikke blir stående igjen
+        if (r.handled)
+          return updateMessage({
+            content: "✔️ Denne ferdigmeldingen er allerede behandlet.",
+            embeds: i.message?.embeds ?? [],
+            components: [],
+          });
+        return ephemeral(r.text);
+      }
       const after = await afterApproval(r, targetId);
       const photoNote = after.wantsPhoto
-        ? after.photoOk
-          ? " · 📸 bilde publisert"
-          : " · ⚠️ bildet kunne ikke publiseres"
+        ? after.queued
+          ? " · 📸 bilde sendes til bildekanalen"
+          : " · ⚠️ bildet ble ikke publisert (bakgrunnsjobb mangler, se oppsett)"
         : "";
       return updateMessage({
         content: `✅ Godkjent av <@${user.id}> · <@${targetId}> fikk ${r.award.delta} poeng for **${r.task.title}**${awardNote(r.award)}${photoNote}`,
@@ -1676,7 +1689,15 @@ async function handleModal(i) {
 
   const comment = i.data.components?.[0]?.components?.[0]?.value?.trim() ?? "";
   const r = await rejectCompletion(taskId, targetId, user.id, comment);
-  if (!r.ok) return ephemeral(r.text);
+  if (!r.ok) {
+    if (r.handled)
+      return updateMessage({
+        content: "✔️ Denne ferdigmeldingen er allerede behandlet.",
+        embeds: i.message?.embeds ?? [],
+        components: [],
+      });
+    return ephemeral(r.text);
+  }
 
   await tryDM(targetId, {
     content:
@@ -2761,12 +2782,12 @@ async function publishPhoto(photoUrl, task, settings) {
   } catch (err) {
     console.warn("refresh-urls feilet, bruker original-URL:", err.message);
   }
-  const res = await fetch(url, { signal: AbortSignal.timeout(2000) });
+  const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`Kunne ikke hente bildet (${res.status})`);
   const type = (res.headers.get("content-type") ?? "image/jpeg").split(";")[0];
   const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length > 8 * 1024 * 1024)
-    throw new Error("Bildet er for stort til å poste på nytt");
+  if (buf.length > 9.5 * 1024 * 1024)
+    throw new Error("Bildet er for stort (over ca. 9,5 MB)");
   const filename = `oppgave.${type.split("/")[1] ?? "jpg"}`;
 
   const form = new FormData();
@@ -2782,27 +2803,81 @@ async function publishPhoto(photoUrl, task, settings) {
   await discord(`/channels/${settings.photoChannelId}/messages`, {
     method: "POST",
     form,
+    timeout: 30000,
   });
   return true;
 }
 
-// Alt som skjer etter at en ferdigmelding er godkjent (parallelt, innen tidsramme)
+// Starter en bakgrunnsjobb ved å kalle Lambdaen asynkront (svarer med en gang, jobben kjører for seg selv)
+let lambdaClient;
+async function dispatchAsync(payload) {
+  try {
+    const { LambdaClient, InvokeCommand } =
+      await import("@aws-sdk/client-lambda");
+    lambdaClient ??= new LambdaClient({});
+    await lambdaClient.send(
+      new InvokeCommand({
+        FunctionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
+        InvocationType: "Event",
+        Payload: JSON.stringify(payload),
+      }),
+    );
+    return true;
+  } catch (err) {
+    console.warn("Kunne ikke starte bakgrunnsjobb:", err.message);
+    return false;
+  }
+}
+
+// Alt som skjer etter at en ferdigmelding er godkjent. Tungt arbeid (bilde, DM, nivå) kjøres
+// i bakgrunnen, slik at knappen svarer innen Discords 3 sekunder.
 async function afterApproval(r, targetId) {
   const settings = await loadSettings();
   const wantsPhoto = Boolean(r.photoUrl && settings.photoChannelId);
-  const [, , photoOk] = await Promise.all([
-    withTimeout(
-      tryDM(targetId, {
-        content: `🎉 **${r.task.title}** er godkjent! Du fikk ${r.award.delta} poeng${awardNote(r.award)}. Takk for innsatsen!`,
-      }),
-      1800,
-    ),
-    withTimeout(syncLevel(targetId), 1800),
-    wantsPhoto
-      ? withTimeout(publishPhoto(r.photoUrl, r.task, settings), 2200, false)
-      : null,
+  const payload = {
+    job: "afterApproval",
+    targetId,
+    title: r.task.title,
+    dm: `🎉 **${r.task.title}** er godkjent! Du fikk ${r.award.delta} poeng${awardNote(r.award)}. Takk for innsatsen!`,
+    photoUrl: wantsPhoto ? r.photoUrl : undefined,
+    photoChannelId: settings.photoChannelId,
+    adminChannelId: settings.adminChannelId,
+  };
+  if (await dispatchAsync(payload)) return { wantsPhoto, queued: true };
+
+  // Reserve hvis bakgrunnsjobb ikke kunne startes: gjør det raske her, hopp over bildet
+  await Promise.all([
+    withTimeout(tryDM(targetId, { content: payload.dm }), 1200),
+    withTimeout(syncLevel(targetId), 1200),
   ]);
-  return { wantsPhoto, photoOk: Boolean(photoOk) };
+  return { wantsPhoto, queued: false };
+}
+
+async function runAfterApproval(p) {
+  await Promise.all([
+    tryDM(p.targetId, { content: p.dm }),
+    syncLevel(p.targetId).catch((err) =>
+      console.warn("syncLevel feilet:", err.message),
+    ),
+  ]);
+  if (p.photoUrl && p.photoChannelId) {
+    try {
+      await publishPhoto(
+        p.photoUrl,
+        { title: p.title },
+        { photoChannelId: p.photoChannelId },
+      );
+    } catch (err) {
+      console.error("Kunne ikke publisere bilde:", err);
+      if (p.adminChannelId) {
+        await postToChannel(p.adminChannelId, {
+          content: `⚠️ Bildet til **${p.title}** kunne ikke publiseres i bildekanalen (${err.message}). Poengene er delt ut som vanlig.`,
+          allowed_mentions: { parse: [] },
+        }).catch(() => {});
+      }
+    }
+  }
+  return { done: true };
 }
 
 /* ============================================================
@@ -3314,7 +3389,7 @@ async function runMonthly() {
 export const handler = async (event) => {
   // Planlagt jobb fra EventBridge (Scheduler: input {"job":"checkin"})
   if (event.job || event.source === "aws.events") {
-    return runJob(event.job ?? "checkin");
+    return runJob(event.job ?? "checkin", event);
   }
 
   // HTTP fra Discord (Lambda Function URL)
