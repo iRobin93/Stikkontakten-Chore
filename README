@@ -1,0 +1,241 @@
+# Frivillig-bot for gamingsenter
+
+En Discord-bot som hjelper frivillige (mange er ungdom) på et gamingsenter med å finne, melde seg på og fullføre oppgaver, og som gir poeng og anerkjennelse for innsatsen. Tonen skal være vennlig og inkluderende, ikke et konkurransepress.
+
+> **Til Claude:** Dette dokumentet er spesifikasjonen. Boten kjører som AWS Lambda (Node.js, `.mjs`) med DynamoDB, og Discord kaller den via HTTP, ikke via en kjørende bot-prosess. Bygg steg for steg etter fasene nederst, start med fase 1. Spør meg hvis noe er uklart før du antar. Skriv all brukervendt tekst i boten på norsk (bokmål).
+
+## Teknisk grunnlag
+
+- **Runtime:** Node.js (ESM, `.mjs`) på **AWS Lambda**. Ingen vedvarende bot-prosess
+- **Filer:** `index.mjs` (Lambda-handler) og `register-commands.mjs` (registrerer slash-kommandoer mot Discord API). Begge lastes opp til Lambda automatisk ved push til GitHub. Spør meg hvordan deploy pakker filene før du deler koden i flere moduler
+- **Interactions Endpoint URL:** Discord kaller Lambda via HTTP. Jeg bruker **Lambda Function URL** (auth type `NONE`, sikkerheten ligger i signaturverifiseringen). Svaret returneres i Function URL-format (`statusCode`, `headers`, `body`). Ikke bruk gateway/`client.login()`. Slash-kommandoer og knappeklikk kommer som POST-requests
+- **Signaturverifisering:** Verifiser Ed25519-signaturen (`X-Signature-Ed25519` og `X-Signature-Timestamp`) på hver request, f.eks. med `discord-interactions` eller `tweetnacl`. Svar på PING (type 1)
+- **3-sekundersgrensen:** Discord krever svar innen 3 sekunder. Gjør tunge ting med deferred response (type 5) og send resultatet som follow-up via interaction-webhooken
+- **Knapper uten «persistent views»:** Legg all info i `custom_id`, f.eks. `signup:<taskId>`, `checkin_keep:<taskId>:<userId>`, `checkin_drop:<taskId>:<userId>`, `approve:<taskId>:<userId>`. Da fungerer knappene uansett hvor gammel meldingen er
+- **Discord REST via `fetch`** (discord.js trengs ikke): sende meldinger i kanaler, sende DM (`POST /users/@me/channels` og deretter melding), gi/fjerne roller, redigere meldinger
+- **Database:** DynamoDB via AWS SDK v3 (`@aws-sdk/client-dynamodb` + `@aws-sdk/lib-dynamodb`)
+- **Planlagte jobber:** Amazon EventBridge (Scheduler/Rules) kaller Lambda. Handleren skal skille mellom HTTP-request fra Discord og scheduled event (f.eks. `event.source === "aws.events"` eller et eget `event.job`-felt)
+- **Hemmeligheter:** `DISCORD_TOKEN`, `DISCORD_PUBLIC_KEY`, `DISCORD_APP_ID`, `GUILD_ID` som miljøvariabler (eller SSM Parameter Store). Kanal- og rolle-IDer kan ligge i en CONFIG-rad i DynamoDB eller som miljøvariabler. Aldri commit token
+- **IAM:** Lambdaen får kun tilgang til den ene tabellen og indeksene
+- **`register-commands.mjs`** kjøres ved endringer i kommandoene (lokalt eller som eget steg i GitHub Actions), ikke ved hver request. Bruk guild-kommandoer under utvikling (oppdateres umiddelbart)
+
+## Roller
+
+| Rolle        | Rettigheter                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------------- |
+| Admin        | Godkjenne/avslå, opprette og slette oppgaver, justere poeng, se logg, eksportere statistikk |
+| Voksen leder | Opprette oppgaver og møter, godkjenne ferdigmeldinger                                       |
+| Frivillig    | Melde seg på, ferdigmelde, foreslå oppgaver, gi «takk»                                      |
+
+Roller kobles til eksisterende Discord-roller (konfigureres i `.env`).
+
+## Oppgaver
+
+### Typer
+
+- **Enkeltoppgaver** opprettet av admin/leder
+- **Ukentlige** (f.eks. pant, ta søppel) – opprettes automatisk fra mal, med rotasjon slik at det blir rettferdig
+- **Månedlige/kvartalsvise** (f.eks. vaske keyboards) – opprettes automatisk fra mal
+- **Foreslåtte oppgaver**: frivillige foreslår med `/foreslå`, admin godkjenner og setter poeng
+
+Hver oppgave har: tittel, beskrivelse, størrelse (lite/middels/stort), poeng, antall plasser, valgfri frist.
+
+### Livssyklus
+
+```
+Åpen → Tatt (påmeldt) → Ferdigmeldt → Godkjent (poeng utdelt)
+              ↓
+          Sluppet → plassen frigjøres → neste på venteliste rykker opp
+```
+
+### Påmelding
+
+- `/oppgaver` viser ledige oppgaver med knapper for å melde seg på
+- Oppgaver har X plasser. Er den full, kan man stille seg på **venteliste**
+- `/mine-oppgaver` viser egne aktive oppgaver, med knapp for å slippe en oppgave
+- Når noen slipper en oppgave, rykker første på ventelisten opp automatisk og får beskjed på DM
+
+### Innsjekk etter 2 dager (erstatter vanlige påminnelser)
+
+Det sendes **ingen** vanlige påminnelser før frist. I stedet:
+
+- Hvis en frivillig har meldt seg på en oppgave og det har gått **2 dager** uten at oppgaven er ferdigmeldt, sender boten én DM
+- Meldingen har to knapper: **«Jeg beholder den»** og **«Slipp oppgaven»**
+- «Slipp oppgaven» frigjør plassen (og ventelisten rykker opp). Ingen straff for å slippe på denne måten
+- «Jeg beholder den» lar oppgaven stå. Innsjekken sendes bare én gang per påmelding
+- Ingen svar = oppgaven beholdes, ingen konsekvens
+- Antall dager (2) skal være en konfigurerbar verdi
+- Påmeldingen lagrer `signedUpAt`. En EventBridge-regel kjører **hver time** og henter påmeldinger med status `active`, uten `checkinSentAt`, og `signedUpAt` eldre enn 2 dager (via GSI, se databasen). For hver: send DM, sett `checkinSentAt`
+- Knappene bruker `custom_id` (`checkin_keep:...` / `checkin_drop:...`), så de fungerer uansett når de trykkes
+- Når oppgaven ferdigmeldes eller slippes før 2 dager, sendes ingen innsjekk
+- Hvis brukeren har DM stengt: post i en egen kanal eller varsle admin i stedet
+
+## Poeng
+
+- Poeng for fullførte oppgaver (etter størrelse), oppmøte på møter, ideer som tas i bruk, å hjelpe/lære opp en annen frivillig, og «redningsbonus» for å ta oppgaver ingen andre vil ha
+- Poeng for å ta med en **ny ordinær besøkende** (ikke ny frivillig, verving av frivillige skjer ikke). Frivillig melder med `/ny-gjest`, og admin/leder bekrefter med knapp at personen faktisk møtte opp (hindrer juks)
+- «Ukens takk»: frivillige kan gi hverandre en takk som gir små poeng (maks X per uke)
+- Nivåer/titler (Rekrutt, Veteran, Legende) som gir Discord-rolle automatisk ved poenggrenser. Nivå baseres på **totalt opptjente poeng** (`totalEarned`)
+- Månedens frivillige kåres automatisk med shoutout i en kanal
+- `/leaderboard` er valgfri eller kun månedlig, og bør være mild i tonen
+- **Alle poengendringer logges** (hvem, hvor mye, hvorfor, av hvem) slik at admin kan rette feil
+
+## Multiplikator
+
+Poeng kan ganges med en multiplikator som bygges opp av streak og andre ting. **Maks totalt ×1,5.**
+
+**Streak (hovedkilden):**
+
+- Én streak-uke teller når den frivillige har møtt opp (møte, vakt eller aktivitet, registrert av admin/leder eller med innsjekk)
+- Forslag: +0,1 per uke på rad, opp til maks +0,5 (altså ×1,5 etter 5 uker)
+- Streak brytes hvis en hel uke går uten oppmøte. Forslag: gå ned ett trinn i stedet for å nullstille, eller tillat ett «fritt hopp» per kvartal (skole, ferie, sykdom)
+- Uken starter mandag, og tidssone er Europe/Oslo
+
+**Andre kilder til multiplikator (ideer, ikke besluttet):**
+
+- Redningsbonus: ta en oppgave ingen andre ville ha (+0,1 til +0,2 på akkurat den oppgaven)
+- Kveld/helg-vakter, eller tidspunkter det er vanskelig å fylle
+- Fullføre oppgaven godt før fristen
+- Fullføre alle ukens faste oppgaver
+- Lære opp eller hjelpe en annen frivillig
+- Delta på arrangement/turnering
+- Sesongkampanjer, f.eks. «dobbel poeng-helg» eller en aktiv uke satt av admin
+- Lagmål: hvis hele gruppa når et felles mål, får alle +0,1 den uka
+
+**Regler for implementasjonen:**
+
+- Bonusene **summeres** (additivt), ikke ganges sammen, og totalen kappes på 1,5
+- Multiplikatoren beregnes og låses i det poengene deles ut, og lagres i poengloggen (`basePoints`, `multiplier`, `delta`) så admin kan se hva som skjedde
+- Alle tall (steg, maks, hopp) ligger i `CONFIG` og kan endres uten ny deploy
+- Vises i `/poeng`, f.eks. «Streak: 3 uker, multiplikator ×1,3»
+
+## Godkjenning
+
+- Frivillig bruker `/ferdig` med valgfritt bilde
+- Forespørselen havner i en egen admin-kanal med knappene ✅ Godkjenn / ❌ Avslå (og valgfri kommentar)
+- Ved godkjenning deles poeng ut, og bildet kan postes automatisk i `#før-og-etter`
+- `/foreslå` fungerer likt: admin godkjenner, setter poeng og publiserer oppgaven
+
+## Møter og aktiviteter
+
+- `/møte` oppretter møte med X frivillig-plasser, påmelding og oppmøteregistrering
+- Poeng for oppmøte, ekstra poeng for ideer som blir tatt i bruk
+- Anonym ideboks via bot. Admin kan markere en idé som «tatt i bruk» og gi poeng (ideen kan knyttes til avsender internt, men vises anonymt)
+- Enkle avstemninger (turneringer, arrangementer, innkjøp)
+
+## Ventesystem / karantene (mykt, ikke straff)
+
+- Maks N aktive oppgaver per person samtidig
+- Maks N _ekstra_ oppgaver per uke, slik at flere får delta
+- Utebli uten å slippe: 2 uteblivelser gir pause fra påmelding i 2 uker. Det skal være tydelig forklart i boten, og admin kan overstyre
+- Alle tall konfigurerbare
+
+## Automatikk (EventBridge → Lambda)
+
+Tre planlagte jobber holder i starten: **hver time** (innsjekk-DM), **hver natt** (maler, admin-varsler) og **mandag morgen** (ukesoppsummering).
+
+- Opprett ukentlige/månedlige oppgaver fra maler
+- Innsjekk-DM etter 2 dager (se over)
+- Mandag: ukentlig oppsummering i en kanal (hva er gjort, hva gjenstår, hvem hjalp mest)
+- Varsel til admin hvis en oppgave ikke er tatt innen X dager
+
+## Slash-kommandoer
+
+**Frivillig**
+
+- `/oppgaver` – se og ta ledige oppgaver
+- `/mine-oppgaver` – se og slippe egne oppgaver
+- `/ferdig` – meld en oppgave som ferdig (valgfritt bilde)
+- `/foreslå` – foreslå en ny oppgave
+- `/poeng` – se egne poeng og nivå
+- `/takk @bruker` – gi en takk
+- `/idé` – send inn anonym idé
+- `/leaderboard` – valgfri toppliste
+
+**Admin/leder**
+
+- `/oppgave-ny`, `/oppgave-rediger`, `/oppgave-slett`
+- `/mal-ny` – opprett mal for gjentakende oppgave
+- `/møte`
+- `/poeng-juster @bruker antall begrunnelse`
+- `/logg @bruker`
+- `/eksport` – statistikk til CSV
+- `/innstillinger` – dager før innsjekk, maks aktive oppgaver osv.
+
+## Databaseutkast (DynamoDB, single-table)
+
+**Jeg oppretter tabellen manuelt i AWS-konsollen.** Ikke lag IaC (SAM/CDK/Terraform). Gi meg i stedet en kort oppskrift: tabellnavn, key schema, GSI-er (navn, nøkler, projection) og hvilke IAM-rettigheter Lambdaen trenger. Tabellnavnet leses fra miljøvariabelen `TABLE_NAME`.
+
+Én tabell `frivillig` med `PK` (partition key) og `SK` (sort key), pluss to GSI-er. Alle tidspunkt som ISO-8601-strenger.
+
+| Entitet       | PK                 | SK                       | Viktige felt                                                                                                   |
+| ------------- | ------------------ | ------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Bruker        | `USER#<discordId>` | `PROFILE`                | points (saldo), totalEarned (brukes til nivå), attendanceStreak, lastStreakWeek, level, pausedUntil, createdAt |
+| Poenglogg     | `USER#<discordId>` | `LOG#<iso>#<uuid>`       | delta, basePoints, multiplier, reason, givenBy                                                                 |
+| Oppgave       | `TASK#<id>`        | `META`                   | title, description, size, points, slots, filledSlots, deadline, status, templateId, createdBy                  |
+| Påmelding     | `TASK#<id>`        | `SIGNUP#<discordId>`     | status (`active`/`waitlist`/`dropped`/`done`), signedUpAt, checkinSentAt, checkinAnswer (`kept`/`dropped`)     |
+| Ferdigmelding | `TASK#<id>`        | `COMPLETION#<discordId>` | photoUrl, status, reviewedBy, reviewedAt                                                                       |
+| Mal           | `TEMPLATE#<id>`    | `META`                   | title, size, points, slots, interval, rotation                                                                 |
+| Møte          | `MEETING#<id>`     | `META`                   | title, slots, startsAt                                                                                         |
+| Møtedeltaker  | `MEETING#<id>`     | `ATTENDEE#<discordId>`   | attended                                                                                                       |
+| Idé           | `IDEA#<id>`        | `META`                   | userId (internt), text, status                                                                                 |
+| Innstillinger | `CONFIG`           | `SETTINGS`               | checkinDays (2), maxActiveTasks, kanal-IDer osv.                                                               |
+
+**GSI1** – oppgaver og innsjekk
+
+- Oppgave: `GSI1PK = TASKSTATUS#open`, `GSI1SK = <deadline eller createdAt>` (til `/oppgaver`)
+- Påmelding: `GSI1PK = SIGNUPSTATUS#active`, `GSI1SK = <signedUpAt>` (til innsjekk-jobben: query alle eldre enn 2 dager)
+
+**GSI2** – «mine ting»
+
+- Påmelding: `GSI2PK = USER#<discordId>`, `GSI2SK = SIGNUP#<signedUpAt>` (til `/mine-oppgaver`)
+
+**Viktig om samtidighet** (Lambda kjører parallelt):
+
+- Påmelding: bruk `TransactWriteItems` som både øker `filledSlots` på oppgaven med `ConditionExpression: filledSlots < slots` og oppretter påmeldingen. Er den full, legg i venteliste i stedet
+- Poeng: bruk `UpdateItem` med `ADD points :delta` (atomisk), og skriv alltid en `LOG#`-rad i samme transaksjon
+- Slipp oppgave: sett påmelding til `dropped`, reduser `filledSlots`, og finn eldste `waitlist`-påmelding på samme oppgave og rykk den opp, alt i én transaksjon der det går
+- Godkjenn/avslå: bruk `ConditionExpression` på status, slik at dobbeltklikk ikke gir dobbelt poeng
+
+## Personvern
+
+Mange frivillige er ungdom. Lagre kun det som trengs: Discord-ID og poeng/oppgavehistorikk. Ikke lagre navn, fødselsdato eller kontaktinfo uten tydelig samtykke. Bilder skal være av oppgaven, ikke av personer. Admin kan slette en brukers data på forespørsel.
+
+## Utviklingsfaser
+
+**Fase 1 – MVP**
+
+- Lambda-handler med signaturverifisering, PING og kommando-ruting i `index.mjs`
+- `register-commands.mjs` med de første kommandoene
+- Oppskrift for DynamoDB-tabell og GSI-er jeg kan lage manuelt (ingen IaC)
+- `/oppgaver`, påmelding, venteliste, `/mine-oppgaver` med slipp
+- `/ferdig` og admin-godkjenning med poeng
+- Innsjekk etter 2 dager
+- Poenglogg og `/poeng`
+
+**Fase 2**
+
+- Maler og automatiske ukentlige/månedlige oppgaver, rotasjon
+- `/foreslå`
+- Møter og oppmøte
+- Ukentlig oppsummering
+
+**Fase 3**
+
+- Nivåer og Discord-roller, streak-multiplikator
+- Ideboks, takk, ny-gjest-bonus
+- Månedens frivillige, bildekanal
+
+**Fase 4**
+
+- Karantene-regler og CSV-eksport
+
+## Åpne spørsmål (Claude: spør meg om disse når du kommer til dem)
+
+- Hvordan pakkes koden ved deploy (zip av filene, esbuild, GitHub Actions)? Kan jeg bruke flere moduler eller bare `index.mjs`?
+- Hvor mange poeng skal lite/middels/stort gi?
+- Hvilke nivåer og poenggrenser?
+- Skal toppliste være på eller av som standard?
+- Gjelder multiplikatoren alle poeng eller bare oppgaver?
+- Hvordan registreres oppmøte: admin krysser av, eller `/innsjekk` av den frivillige?
+- Hvordan bekreftes en ny ordinær besøkende: bare admin-knapp, eller må personen komme X ganger?

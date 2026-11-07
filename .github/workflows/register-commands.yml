@@ -21,3 +21,4 @@ jobs:
         env:
           APP_ID: ${{ secrets.DISCORD_APP_ID }}
           BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          GUILD_ID: ${{ vars.GUILD_ID }}
