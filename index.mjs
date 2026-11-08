@@ -15,6 +15,7 @@ import {
   TransactWriteCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { randomBytes, randomUUID } from "node:crypto";
+import { deflateRawSync } from "node:zlib";
 
 /* ============================================================
  * Oppsett
@@ -3690,23 +3691,277 @@ const EXPORT_LABELS = {
   moter: "Møter",
 };
 
-const osloStamp = (iso) =>
-  iso ? new Date(iso).toLocaleString("sv-SE", { timeZone: "Europe/Oslo" }) : "";
+// Én gjenbrukt formatter: å opprette en ny per rad er ca. 30 ganger tregere (merkbart ved store eksporter)
+const OSLO_STAMP = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: "Europe/Oslo",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
+const osloStamp = (iso) => (iso ? OSLO_STAMP.format(new Date(iso)) : "");
 
 // Norsk Excel: semikolon som skilletegn, komma som desimaltegn, UTF-8 med BOM.
 // Tekst som starter med = + - @ prefikses, så regneark ikke tolker den som formel.
-function csvCell(v) {
+function csvCell(v, forceText = false) {
   if (v === null || v === undefined) return "";
+  // IDer som ligner tall (f.eks. 12e45678 eller 18-sifrede Discord-IDer) tvinges til tekst, så Excel/Sheets ikke runder av
+  if (forceText && typeof v === "string" && /^[\d.]+(e[+-]?\d+)?$/i.test(v))
+    return `="${v}"`;
   if (typeof v === "boolean") return v ? "ja" : "nei";
   if (typeof v === "number") return String(v).replace(".", ",");
   let s = String(v);
   if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   return /[;"\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
-const toCsv = (header, rows) =>
-  "\uFEFF" +
-  [header, ...rows].map((r) => r.map(csvCell).join(";")).join("\r\n") +
-  "\r\n";
+function toCsv(header, rows, idCols = []) {
+  const ids = new Set(idCols);
+  const lines = [
+    header.map((h) => csvCell(h)),
+    ...rows.map((r) => r.map((v, c) => csvCell(v, ids.has(c)))),
+  ];
+  return "\uFEFF" + lines.map((l) => l.join(";")).join("\r\n") + "\r\n";
+}
+
+/* ---------- XLSX uten avhengigheter (zip + Office Open XML) ---------- */
+
+const XLSX_MIME =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const SHEET_NAMES = {
+  frivillige: "Frivillige",
+  oppgaver: "Oppgaver",
+  poenglogg: "Poenglogg",
+  moter: "Møter",
+};
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xffffffff;
+  for (let n = 0; n < buf.length; n++)
+    c = CRC_TABLE[(c ^ buf[n]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+// Minimal zip-skriver (deflate). Nok for en xlsx-fil.
+function zipFiles(entries) {
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+  const dosDate = ((2026 - 1980) << 9) | (1 << 5) | 1;
+  for (const { name, data } of entries) {
+    const nameBuf = Buffer.from(name, "utf8");
+    const raw = Buffer.isBuffer(data) ? data : Buffer.from(data, "utf8");
+    const comp = deflateRawSync(raw);
+    const crc = crc32(raw);
+
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0);
+    lh.writeUInt16LE(20, 4); // versjon som trengs
+    lh.writeUInt16LE(0x0800, 6); // UTF-8-filnavn
+    lh.writeUInt16LE(8, 8); // deflate
+    lh.writeUInt16LE(0, 10);
+    lh.writeUInt16LE(dosDate, 12);
+    lh.writeUInt32LE(crc, 14);
+    lh.writeUInt32LE(comp.length, 18);
+    lh.writeUInt32LE(raw.length, 22);
+    lh.writeUInt16LE(nameBuf.length, 26);
+    lh.writeUInt16LE(0, 28);
+    locals.push(lh, nameBuf, comp);
+
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0);
+    ch.writeUInt16LE(20, 4);
+    ch.writeUInt16LE(20, 6);
+    ch.writeUInt16LE(0x0800, 8);
+    ch.writeUInt16LE(8, 10);
+    ch.writeUInt16LE(0, 12);
+    ch.writeUInt16LE(dosDate, 14);
+    ch.writeUInt32LE(crc, 16);
+    ch.writeUInt32LE(comp.length, 20);
+    ch.writeUInt32LE(raw.length, 24);
+    ch.writeUInt16LE(nameBuf.length, 28);
+    ch.writeUInt32LE(offset, 42);
+    centrals.push(ch, nameBuf);
+    offset += 30 + nameBuf.length + comp.length;
+  }
+  const cd = Buffer.concat(centrals);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(cd.length, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, cd, end]);
+}
+
+// Fjerner tegn som ikke er lov i XML (ellers blir filen «ødelagt» i Excel)
+const xmlEscape = (s) =>
+  String(s)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g, "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+function colLetter(n) {
+  let s = "";
+  for (let x = n + 1; x > 0; x = Math.floor((x - 1) / 26))
+    s = String.fromCharCode(65 + ((x - 1) % 26)) + s;
+  return s;
+}
+
+// «2026-11-02 10:00:00» eller «2026-11-02» → Excel-dato (serienummer, uten tidssone)
+function excelSerial(str) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2}):(\d{2}))?$/.exec(
+    String(str),
+  );
+  if (!m) return null;
+  const [y, mo, d, h = 0, mi = 0, se = 0] = m
+    .slice(1)
+    .map((x) => (x === undefined ? undefined : Number(x)));
+  return Date.UTC(y, mo - 1, d, h, mi, se) / 86400000 + 25569;
+}
+
+function sheetXml(header, rows, { idCols = [], dateCols = [] } = {}) {
+  const idSet = new Set(idCols);
+  const dateSet = new Set(dateCols);
+  const widths = header.map((h) => Math.min(60, String(h).length + 4));
+  const out = [
+    `<row r="1">${header
+      .map(
+        (h, c) =>
+          `<c r="${colLetter(c)}1" s="1" t="inlineStr"><is><t>${xmlEscape(h)}</t></is></c>`,
+      )
+      .join("")}</row>`,
+  ];
+  rows.forEach((row, r) => {
+    const cells = [];
+    row.forEach((v, c) => {
+      if (v === null || v === undefined || v === "") return;
+      const ref = `${colLetter(c)}${r + 2}`;
+      if (r < 300)
+        widths[c] = Math.max(widths[c], Math.min(60, String(v).length + 2));
+      if (!idSet.has(c) && typeof v === "number" && Number.isFinite(v)) {
+        cells.push(`<c r="${ref}"><v>${v}</v></c>`);
+      } else if (!idSet.has(c) && typeof v === "boolean") {
+        cells.push(`<c r="${ref}" t="b"><v>${v ? 1 : 0}</v></c>`);
+      } else if (dateSet.has(c) && excelSerial(v) !== null) {
+        cells.push(
+          `<c r="${ref}" s="${String(v).length === 10 ? 3 : 2}"><v>${excelSerial(v)}</v></c>`,
+        );
+      } else {
+        // IDer og all annen tekst lagres som tekst, så Excel aldri runder av eller tolker dem
+        cells.push(
+          `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${xmlEscape(v)}</t></is></c>`,
+        );
+      }
+    });
+    out.push(`<row r="${r + 2}">${cells.join("")}</row>`);
+  });
+  const cols = widths
+    .map(
+      (w, c) =>
+        `<col min="${c + 1}" max="${c + 1}" width="${w}" customWidth="1"/>`,
+    )
+    .join("");
+  return (
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+    `<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>` +
+    `<selection pane="bottomLeft"/></sheetView></sheetViews>` +
+    `<cols>${cols}</cols><sheetData>${out.join("")}</sheetData>` +
+    `<autoFilter ref="A1:${colLetter(header.length - 1)}${rows.length + 1}"/></worksheet>`
+  );
+}
+
+const XLSX_STYLES =
+  `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+  `<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">` +
+  `<numFmts count="2"><numFmt numFmtId="164" formatCode="yyyy\\-mm\\-dd\\ hh:mm"/><numFmt numFmtId="165" formatCode="yyyy\\-mm\\-dd"/></numFmts>` +
+  `<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>` +
+  `<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>` +
+  `<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>` +
+  `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
+  `<cellXfs count="4">` +
+  `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+  `<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>` +
+  `<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>` +
+  `<xf numFmtId="165" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>` +
+  `</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`;
+
+// sheets: [{ name, header, rows, idCols, dateCols }]
+function buildXlsx(sheets) {
+  const n = sheets.length;
+  const files = [
+    {
+      name: "[Content_Types].xml",
+      data:
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+        `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+        `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+        `<Default Extension="xml" ContentType="application/xml"/>` +
+        `<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
+        `<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>` +
+        sheets
+          .map(
+            (_, k) =>
+              `<Override PartName="/xl/worksheets/sheet${k + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`,
+          )
+          .join("") +
+        `</Types>`,
+    },
+    {
+      name: "_rels/.rels",
+      data:
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+        `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
+    },
+    {
+      name: "xl/workbook.xml",
+      data:
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+        `<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>` +
+        sheets
+          .map(
+            (s, k) =>
+              `<sheet name="${xmlEscape(s.name)}" sheetId="${k + 1}" r:id="rId${k + 1}"/>`,
+          )
+          .join("") +
+        `</sheets></workbook>`,
+    },
+    {
+      name: "xl/_rels/workbook.xml.rels",
+      data:
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+        `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        sheets
+          .map(
+            (_, k) =>
+              `<Relationship Id="rId${k + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${k + 1}.xml"/>`,
+          )
+          .join("") +
+        `<Relationship Id="rId${n + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
+    },
+    { name: "xl/styles.xml", data: XLSX_STYLES },
+    ...sheets.map((s, k) => ({
+      name: `xl/worksheets/sheet${k + 1}.xml`,
+      data: sheetXml(s.header, s.rows, s),
+    })),
+  ];
+  return zipFiles(files);
+}
 
 async function scanAll(params) {
   const items = [];
@@ -3785,6 +4040,8 @@ async function buildExport(type, { fraIso, toIso }) {
       ],
       rows,
       userCol: 0,
+      idCols: [0],
+      dateCols: [7],
     };
   }
 
@@ -3822,6 +4079,8 @@ async function buildExport(type, { fraIso, toIso }) {
         t.createdBy ?? "",
       ]),
       userCol: null,
+      idCols: [0, 10, 11],
+      dateCols: [8, 9],
     };
   }
 
@@ -3851,6 +4110,8 @@ async function buildExport(type, { fraIso, toIso }) {
         l.taskId ?? "",
       ]),
       userCol: 1,
+      idCols: [1, 6, 7],
+      dateCols: [0],
     };
   }
 
@@ -3869,6 +4130,8 @@ async function buildExport(type, { fraIso, toIso }) {
       m.attendedCount ?? 0,
     ]),
     userCol: null,
+    idCols: [0],
+    dateCols: [2],
   };
 }
 
@@ -3899,7 +4162,7 @@ async function lookupNames(userIds, cache = new Map()) {
 const EXPORT_MAX_BYTES = 9.5 * 1024 * 1024; // Discord tar imot ca. 10 MB per melding uten serverboost
 const EXPORT_ALL = ["frivillige", "oppgaver", "poenglogg", "moter"];
 
-// Sender én melding med null eller flere CSV-filer på DM.
+// Sender én melding med null eller flere filer på DM.
 // Er DM stengt, havner den i admin-kanalen.
 async function deliverToRequester(p, content, files = []) {
   const makeForm = (text) => {
@@ -3915,11 +4178,7 @@ async function deliverToRequester(p, content, files = []) {
       }),
     );
     files.forEach((f, n) =>
-      form.append(
-        `files[${n}]`,
-        new Blob([f.csv], { type: "text/csv; charset=utf-8" }),
-        f.name,
-      ),
+      form.append(`files[${n}]`, new Blob([f.data], { type: f.mime }), f.name),
     );
     return form;
   };
@@ -3955,59 +4214,93 @@ async function runExport(p) {
       ? osloLocalToIso(addDays(p.til, 1), "00:00")
       : undefined; // «til» er inklusiv
     const types = p.type === "alt" ? EXPORT_ALL : [p.type];
+    const format = p.format === "csv" ? "csv" : "xlsx";
     const nameCache = new Map();
-    const files = [];
+    const datasets = [];
     const lines = [];
 
     for (const type of types) {
-      const { header, rows, userCol } = await buildExport(type, {
-        fraIso,
-        toIso,
-      });
-      const label = EXPORT_LABELS[type];
-      if (!rows.length) {
-        lines.push(`• ${label}: ingen rader`);
-        continue;
-      }
-      let head = header;
-      let body = rows;
-      if (p.names && userCol !== null) {
+      let { header, rows, userCol, idCols, dateCols } = await buildExport(
+        type,
+        { fraIso, toIso },
+      );
+      if (p.names && userCol !== null && rows.length) {
         await lookupNames(
           rows.map((r) => r[userCol]),
           nameCache,
         );
-        head = [
+        const shift = (cols) => cols.map((c) => (c > userCol ? c + 1 : c));
+        header = [
           ...header.slice(0, userCol + 1),
           "brukernavn",
           ...header.slice(userCol + 1),
         ];
-        body = rows.map((r) => [
+        rows = rows.map((r) => [
           ...r.slice(0, userCol + 1),
           nameCache.get(r[userCol]) ?? "",
           ...r.slice(userCol + 1),
         ]);
+        idCols = shift(idCols);
+        dateCols = shift(dateCols);
       }
-      const csv = toCsv(head, body);
-      if (Buffer.byteLength(csv) > EXPORT_MAX_BYTES) {
-        lines.push(
-          `• ${label}: ${rows.length} rader, men filen er for stor for Discord. Avgrens perioden med \`fra\` og \`til\``,
-        );
-        continue;
+      datasets.push({
+        type,
+        name: SHEET_NAMES[type],
+        header,
+        rows,
+        idCols,
+        dateCols,
+      });
+      lines.push(
+        `• ${EXPORT_LABELS[type]}: ${rows.length ? `${rows.length} rader` : "ingen rader"}`,
+      );
+    }
+
+    const files = [];
+    if (datasets.some((d) => d.rows.length)) {
+      if (format === "xlsx") {
+        // Én arbeidsbok med én fane per type (tomme typer får en fane med bare overskrifter)
+        const data = buildXlsx(datasets);
+        if (data.length > EXPORT_MAX_BYTES)
+          lines.push(
+            "⚠️ Excel-filen ble for stor for Discord. Avgrens perioden med `fra` og `til`, eller bruk `format:csv`.",
+          );
+        else
+          files.push({
+            name: `eksport-${p.type}-${todayOslo()}.xlsx`,
+            data,
+            mime: XLSX_MIME,
+          });
+      } else {
+        for (const d of datasets.filter((x) => x.rows.length)) {
+          const data = Buffer.from(toCsv(d.header, d.rows, d.idCols), "utf8");
+          if (data.length > EXPORT_MAX_BYTES) {
+            lines.push(
+              `⚠️ ${EXPORT_LABELS[d.type]}: filen er for stor for Discord. Avgrens perioden med \`fra\` og \`til\``,
+            );
+            continue;
+          }
+          files.push({
+            name: `eksport-${d.type}-${todayOslo()}.csv`,
+            data,
+            mime: "text/csv; charset=utf-8",
+          });
+        }
       }
-      files.push({ name: `eksport-${type}-${todayOslo()}.csv`, csv });
-      lines.push(`• ${label}: ${rows.length} rader`);
     }
 
     const period =
       p.fra || p.til ? ` (${p.fra ?? "start"} til ${p.til ?? "nå"})` : "";
+    const footer =
+      format === "xlsx"
+        ? "Excel-fil med én fane per type. Åpnes direkte i Excel og Google Sheets. Inneholder personopplysninger, så ikke del den videre."
+        : "Semikolon-separert UTF-8, åpnes direkte i Excel. Inneholder personopplysninger, så ikke del dem videre.";
     const content =
       `📤 **Eksport: ${EXPORT_LABELS[p.type]}**${period}\n${lines.join("\n")}` +
-      (files.length
-        ? "\nSemikolon-separert UTF-8, åpnes direkte i Excel. Inneholder personopplysninger, så ikke del dem videre."
-        : "");
+      (files.length ? `\n${footer}` : "");
 
     // Alle filene i én melding hvis de får plass, ellers én melding per fil
-    const total = files.reduce((n, f) => n + Buffer.byteLength(f.csv), 0);
+    const total = files.reduce((n, f) => n + f.data.length, 0);
     const groups =
       files.length && total > EXPORT_MAX_BYTES
         ? files.map((f) => [f])
@@ -4020,7 +4313,7 @@ async function runExport(p) {
         group,
       );
     }
-    return { files: files.length, where };
+    return { files: files.length, where, format };
   } catch (err) {
     console.error("Eksport feilet:", err);
     const hint = /AccessDenied|not authorized/i.test(String(err.message))
@@ -4056,6 +4349,7 @@ async function cmdEksport(i, opts, userId) {
     fra: opts.fra,
     til: opts.til,
     names: Boolean(opts.brukernavn),
+    format: opts.format ?? "xlsx",
     requesterId: userId,
     adminChannelId: settings.adminChannelId,
   });
@@ -4069,7 +4363,7 @@ async function cmdEksport(i, opts, userId) {
       ? "\n_Merk: perioden brukes ikke for «Frivillige»._"
       : "";
   return ephemeral(
-    `📤 Eksporten **${EXPORT_LABELS[opts.type]}** lages nå. ${opts.type === "alt" ? "Filene kommer" : "Filen kommer"} på DM til deg om litt (eller i admin-kanalen hvis DM er stengt).${note}`,
+    `📤 Eksporten **${EXPORT_LABELS[opts.type]}** lages nå. ${(opts.format ?? "xlsx") === "xlsx" ? "Excel-filen kommer" : opts.type === "alt" ? "Filene kommer" : "Filen kommer"} på DM til deg om litt (eller i admin-kanalen hvis DM er stengt).${note}`,
   );
 }
 

@@ -392,6 +392,15 @@ const commands = [
         name: "brukernavn",
         description: "Ta med brukernavn i filen (standard: bare Discord-ID)",
       },
+      {
+        type: STRING,
+        name: "format",
+        description: "Filformat (standard: Excel med én fane per type)",
+        choices: [
+          { name: "Excel (.xlsx), standard", value: "xlsx" },
+          { name: "CSV (semikolon)", value: "csv" },
+        ],
+      },
     ],
   },
   {

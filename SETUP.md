@@ -181,12 +181,15 @@ Opprett fire schedules i EventBridge Scheduler, alle med Lambdaen som target og 
 
 **`/eksport`** (bare admin)
 
-- Velg `type`: **Alt**, Frivillige, Oppgaver, Poenglogg eller Møter. «Alt» lager de fire filene i én kjøring og sender dem samlet i én melding. Får de ikke plass i én melding (over ca. 10 MB til sammen), kommer de som flere meldinger. Typer uten data hoppes over, og meldingen forteller hva som er med. `fra` og `til` (`ÅÅÅÅ-MM-DD`, inklusive, norsk tid) avgrenser oppgaver, poenglogg og møter. De brukes ikke for Frivillige.
+- Velg `type`: **Alt**, Frivillige, Oppgaver, Poenglogg eller Møter. `fra` og `til` (`ÅÅÅÅ-MM-DD`, inklusive, norsk tid) avgrenser oppgaver, poenglogg og møter. De brukes ikke for Frivillige.
+- **Format (`format`):** standard er **Excel (.xlsx)** med én fane per type. «Alt» gir én fil med fire faner (Frivillige, Oppgaver, Poenglogg, Møter). Tomme typer får en fane med bare overskrifter. Velg `format:csv` for CSV i stedet (én fil per type).
 - Filen lages i en bakgrunnsjobb og sendes som vedlegg på **DM** til den som kjørte kommandoen. Er DM stengt, havner den i admin-kanalen.
-- Filen har Discord-ID-er. Sett `brukernavn:ja` for å få en kolonne med servernavn (de som har forlatt serveren, markeres).
-- Formatet er **semikolon, komma som desimaltegn og UTF-8 med BOM**, så den åpnes rett i norsk Excel. I Google Sheets: Fil → Importer → velg semikolon som skilletegn. Tekst som starter med `=`, `+`, `-` eller `@` får en apostrof foran, så regneark ikke tolker den som formel.
-- Eksporten henter data med en **Scan** av tabellen, så Lambdaen trenger `dynamodb:Scan` (lagt til i policyen over). På denne størrelsen er det billig og raskt.
-- Filer over ca. 10 MB kan ikke sendes på Discord. Avgrens da perioden.
+- `brukernavn:ja` legger til en kolonne med servernavn (de som har forlatt serveren, markeres). Standard er bare Discord-ID.
+- **Excel-filen** har fet og frosset overskriftsrad, filter, passende kolonnebredder og ekte datoer og tall (klar for pivottabeller). **ID-er (Discord-ID, oppgave-ID, mal-ID) lagres som tekst**, så Excel og Google Sheets ikke avrunder eller omformer dem. Tekst tolkes aldri som formel. Filen lages uten eksterne pakker, så `package.json` trenger ingen endring.
+- **CSV-filen** bruker semikolon, komma som desimaltegn og UTF-8 med BOM. ID-er skrives som `="…"` så de vises riktig ved dobbeltklikk. Importerer du CSV via Power Query, bruk heller xlsx. Tekst som starter med `=`, `+`, `-` eller `@` får en apostrof foran.
+- I Google Sheets: Fil → Importer → Last opp → velg xlsx-filen. Alle faner kommer med.
+- Eksporten henter data med en **Scan** av tabellen, så Lambdaen trenger `dynamodb:Scan` (lagt til i policyen over). 160 000 poengrader tar ca. 2 sekunder å bygge.
+- Filer over ca. 10 MB kan ikke sendes på Discord. Xlsx er komprimert og blir langt mindre enn CSV (160 000 poengrader ≈ 4,6 MB mot over 10 MB). Er filen likevel for stor, sier boten fra. Avgrens da perioden.
 - Eksporten inneholder personopplysninger. Del den ikke videre, og slett den fra DM når du er ferdig.
 
 ## Kjente begrensninger i fase 1
