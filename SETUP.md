@@ -242,3 +242,5 @@ Gjentakende møter som legges ut automatisk, som oppgavemaler.
 - Poengjusteringer endrer både saldo og `totalEarned`, siden det ikke finnes noe poengforbruk i fase 1.
 
 **Møteplasser:** møter har ubegrenset antall plasser som standard, så alle med Frivillig-rollen kan melde seg på. Sett `plasser` på `/møte` eller `/møtemal-ny` hvis du vil ha et tak. Eksisterende møter beholder sin grense.
+
+**Deltakerliste på møter:** møtemeldingen viser hvem som er påmeldt (🙋) og hvem som har sjekket inn (✅), som Discord-navn uten at noen pinges. Listen oppdateres når noen melder seg på, av eller sjekker inn. Er den lang, vises de første og resten som «…og N til».

@@ -1726,7 +1726,7 @@ async function handleComponent(i) {
           `/channels/${i.message.channel_id ?? i.channel_id}/messages/${i.message.id}`,
           {
             method: "PATCH",
-            body: renderMeeting(m),
+            body: await renderMeetingFull(m),
           },
         ).catch((e) =>
           console.warn("Kunne ikke oppdatere møtemelding", e.message),
@@ -2270,7 +2270,44 @@ const attendeeKey = (id, uid) => ({
   SK: `ATTENDEE#${uid}`,
 });
 
-function renderMeeting(m) {
+// Deltakerliste: ✅ = har sjekket inn, 🙋 = påmeldt. Nevnes uten å pinge (allowed_mentions er tom).
+function attendeeLines(attendees) {
+  if (!attendees?.length) return "";
+  const sorted = [...attendees].sort((a, b) =>
+    a.joinedAt.localeCompare(b.joinedAt),
+  );
+  const shown = [];
+  let len = 0;
+  for (const a of sorted) {
+    const line = `${a.attended ? "✅" : "🙋"} <@${a.userId}>`;
+    if (len + line.length + 1 > 3000) break;
+    shown.push(line);
+    len += line.length + 1;
+  }
+  const rest = sorted.length - shown.length;
+  return `\n\n**Deltakere**\n${shown.join("\n")}${rest ? `\n…og ${rest} til` : ""}`;
+}
+
+async function meetingAttendees(meetingId) {
+  return queryAll({
+    KeyConditionExpression: "PK = :p AND begins_with(SK, :s)",
+    ExpressionAttributeValues: {
+      ":p": `MEETING#${meetingId}`,
+      ":s": "ATTENDEE#",
+    },
+  });
+}
+
+// Henter deltakerne og bygger meldingen. Feiler henting, vises møtet uten liste.
+async function renderMeetingFull(m) {
+  const attendees = await meetingAttendees(m.id).catch((err) => {
+    console.warn("Kunne ikke hente deltakere:", err.message);
+    return [];
+  });
+  return renderMeeting(m, attendees);
+}
+
+function renderMeeting(m, attendees = []) {
   const ts = Math.floor(Date.parse(m.startsAt) / 1000);
   return {
     embeds: [
@@ -2279,7 +2316,8 @@ function renderMeeting(m) {
         description:
           `🕒 <t:${ts}:F> (<t:${ts}:R>)\n` +
           `👥 ${m.slots == null ? `${m.filledSlots} påmeldt` : `${m.filledSlots} av ${m.slots} plasser er tatt`}\n` +
-          `📍 ${m.attendedCount ?? 0} har sjekket inn`,
+          `📍 ${m.attendedCount ?? 0} har sjekket inn` +
+          attendeeLines(attendees),
         color: 0x5865f2,
         footer: {
           text: "Meld deg på på forhånd, og sjekk inn med knappen når møtet er i gang.",
@@ -2340,7 +2378,7 @@ async function cmdMote(i, opts, userId) {
   );
   // Postes som vanlig bot-melding (ikke interaksjonssvar), så den kan redigeres senere
   try {
-    await postToChannel(i.channel_id, renderMeeting(meeting));
+    await postToChannel(i.channel_id, await renderMeetingFull(meeting));
   } catch (err) {
     console.error("Kunne ikke poste møtemelding", err.message);
     return ephemeral(
@@ -4821,7 +4859,7 @@ async function spawnMeetingFromTemplate(tpl) {
   if (!r.ok) return null; // noen andre rakk det først
 
   try {
-    await postToChannel(tpl.channelId, renderMeeting(meeting));
+    await postToChannel(tpl.channelId, await renderMeetingFull(meeting));
     return { meeting, occ };
   } catch (err) {
     console.error("Kunne ikke poste møte fra mal", tpl.id, err.message);
