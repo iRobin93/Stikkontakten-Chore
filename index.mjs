@@ -4135,24 +4135,46 @@ async function buildExport(type, { fraIso, toIso }) {
   };
 }
 
-async function lookupNames(userIds, cache = new Map()) {
+// Navn: først servernavn (kallenavn), ellers globalt visningsnavn/brukernavn.
+// Faller tilbake til /users/{id}, som virker uten GUILD_ID og uten at personen er på serveren.
+async function lookupNames(userIds, cache = new Map(), problems = {}) {
   const guild = process.env.GUILD_ID;
-  if (!guild) return cache;
+  if (!guild) problems.noGuild = true;
   const missing = [...new Set(userIds)]
     .filter((id) => !cache.has(id))
     .slice(0, 500);
   for (const part of chunk(missing, 5)) {
     await Promise.all(
       part.map(async (id) => {
-        try {
-          const m = await discord(`/guilds/${guild}/members/${id}`);
-          cache.set(
-            id,
-            m.nick ?? m.user?.global_name ?? m.user?.username ?? "",
-          );
-        } catch (err) {
-          cache.set(id, err.status === 404 ? "(forlatt serveren)" : "");
+        let name = null;
+        let left = false;
+        if (guild) {
+          try {
+            const m = await discord(`/guilds/${guild}/members/${id}`);
+            name = m.nick ?? m.user?.global_name ?? m.user?.username ?? null;
+          } catch (err) {
+            if (err.status === 404) left = true;
+            else {
+              problems.guildError ??= `Discord svarte ${err.status ?? "feil"}`;
+              console.warn("Servernavn feilet for", id, err.message);
+            }
+          }
         }
+        if (!name) {
+          try {
+            const u = await discord(`/users/${id}`);
+            name =
+              (u.global_name ?? u.username ?? "") +
+              (left && (u.global_name ?? u.username)
+                ? " (forlatt serveren)"
+                : "");
+          } catch (err) {
+            problems.userError ??= `Discord svarte ${err.status ?? "feil"}`;
+            console.warn("Brukernavn feilet for", id, err.message);
+            name = left ? "(forlatt serveren)" : "";
+          }
+        }
+        cache.set(id, name ?? "");
       }),
     );
   }
@@ -4216,6 +4238,7 @@ async function runExport(p) {
     const types = p.type === "alt" ? EXPORT_ALL : [p.type];
     const format = p.format === "csv" ? "csv" : "xlsx";
     const nameCache = new Map();
+    const nameProblems = {};
     const datasets = [];
     const lines = [];
 
@@ -4228,6 +4251,7 @@ async function runExport(p) {
         await lookupNames(
           rows.map((r) => r[userCol]),
           nameCache,
+          nameProblems,
         );
         const shift = (cols) => cols.map((c) => (c > userCol ? c + 1 : c));
         header = [
@@ -4254,6 +4278,26 @@ async function runExport(p) {
       lines.push(
         `• ${EXPORT_LABELS[type]}: ${rows.length ? `${rows.length} rader` : "ingen rader"}`,
       );
+    }
+
+    if (p.names && nameCache.size) {
+      const unresolved = [...nameCache.values()].filter((v) => !v).length;
+      if (unresolved)
+        lines.push(
+          `⚠️ Brukernavn: fikk ikke hentet ${unresolved} av ${nameCache.size}` +
+            (nameProblems.userError || nameProblems.guildError
+              ? ` (${nameProblems.userError ?? nameProblems.guildError})`
+              : "") +
+            ". Sjekk at `DISCORD_TOKEN` er riktig, og se CloudWatch-loggen.",
+        );
+      if (nameProblems.noGuild)
+        lines.push(
+          "ℹ️ `GUILD_ID` mangler på Lambdaen, så navnene er globale brukernavn og ikke kallenavn på serveren.",
+        );
+      else if (nameProblems.guildError && !unresolved)
+        lines.push(
+          `ℹ️ Fikk ikke hentet kallenavn på serveren (${nameProblems.guildError}), så navnene er globale brukernavn.`,
+        );
     }
 
     const files = [];
