@@ -3,6 +3,7 @@
 
 const STRING = 3;
 const INTEGER = 4;
+const BOOLEAN = 5;
 const USER = 6;
 const ATTACHMENT = 11;
 
@@ -143,6 +144,60 @@ const commands = [
         type: STRING,
         name: "frist",
         description: "Frist som ÅÅÅÅ-MM-DD (valgfri)",
+      },
+    ],
+  },
+  {
+    name: "oppgave-rediger",
+    description: "Endre en åpen oppgave (admin/leder)",
+    options: [
+      {
+        type: STRING,
+        name: "oppgave",
+        description: "Hvilken oppgave?",
+        required: true,
+        autocomplete: true,
+      },
+      {
+        type: STRING,
+        name: "tittel",
+        description: "Ny tittel",
+        max_length: 80,
+      },
+      {
+        type: STRING,
+        name: "beskrivelse",
+        description: "Ny beskrivelse",
+        max_length: 300,
+      },
+      {
+        type: STRING,
+        name: "størrelse",
+        description: "Ny størrelse (poengene endres ikke av seg selv)",
+        choices: [
+          { name: "Lite", value: "small" },
+          { name: "Middels", value: "medium" },
+          { name: "Stort", value: "large" },
+        ],
+      },
+      {
+        type: INTEGER,
+        name: "plasser",
+        description: "Nytt antall plasser",
+        min_value: 1,
+        max_value: 50,
+      },
+      {
+        type: INTEGER,
+        name: "poeng",
+        description: "Nye poeng",
+        min_value: 0,
+        max_value: 10000,
+      },
+      {
+        type: STRING,
+        name: "frist",
+        description: "Ny frist som ÅÅÅÅ-MM-DD, eller «ingen» for å fjerne",
       },
     ],
   },
@@ -302,6 +357,39 @@ const commands = [
         description: "Antall frivillig-plasser (standard 20)",
         min_value: 1,
         max_value: 200,
+      },
+    ],
+  },
+  {
+    name: "eksport",
+    description: "Eksporter data til CSV (admin)",
+    options: [
+      {
+        type: STRING,
+        name: "type",
+        description: "Hva skal eksporteres?",
+        required: true,
+        choices: [
+          { name: "Frivillige (poeng, nivå, streak)", value: "frivillige" },
+          { name: "Oppgaver", value: "oppgaver" },
+          { name: "Poenglogg", value: "poenglogg" },
+          { name: "Møter", value: "moter" },
+        ],
+      },
+      {
+        type: STRING,
+        name: "fra",
+        description: "Fra dato (ÅÅÅÅ-MM-DD), valgfri",
+      },
+      {
+        type: STRING,
+        name: "til",
+        description: "Til og med dato (ÅÅÅÅ-MM-DD), valgfri",
+      },
+      {
+        type: BOOLEAN,
+        name: "brukernavn",
+        description: "Ta med brukernavn i filen (standard: bare Discord-ID)",
       },
     ],
   },

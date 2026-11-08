@@ -1,4 +1,4 @@
-# Oppsett – fase 1, 2 og 3
+# Oppsett – fase 1 til 4
 
 ## 1. DynamoDB-tabell (manuelt i konsollen)
 
@@ -36,6 +36,7 @@ Erstatt region/konto. Gir tilgang til kun denne tabellen og indeksene:
         "dynamodb:UpdateItem",
         "dynamodb:DeleteItem",
         "dynamodb:Query",
+        "dynamodb:Scan",
         "dynamodb:BatchGetItem"
       ],
       "Resource": [
@@ -167,6 +168,26 @@ Opprett fire schedules i EventBridge Scheduler, alle med Lambdaen som target og 
 **Bildekanal:** sett «Bildekanal» i `/innstillinger`. Ved godkjenning lastes bildet ned og postes på nytt i kanalen (uten navn), siden Discord-lenker utløper. Botten trenger _Attach Files_ i bildekanalen. Dette skjer i en bakgrunnsjobb (se IAM over), så godkjenningen svarer med en gang selv om bildet er stort. Er originalen over grensen, ber botten Discord om en nedskalert versjon (maks 2560 px på lengste side, som WebP) og poster den i stedet. Grensen er innstillingen «Bilde: maks størrelse i MB» (standard 9,5, siden en server uten boost tar imot ca. 10 MB). Har serveren boost, kan du øke den. Hvis det feiler, får admin-kanalen en advarsel, og poengene er likevel delt ut.
 
 **Innstillinger:** det er nå mange, så `innstilling` bruker autocomplete. Skriv f.eks. «poeng» eller «streak» for å finne dem.
+
+## Fase 4: slik fungerer det
+
+**`/oppgave-rediger`** (admin/leder)
+
+- Velg en åpen oppgave fra listen, og fyll inn bare feltene du vil endre: `tittel`, `beskrivelse`, `størrelse`, `plasser`, `poeng`, `frist` (`ÅÅÅÅ-MM-DD`, eller `ingen` for å fjerne fristen).
+- **Plasser** kan ikke settes lavere enn antall som allerede har tatt eller fullført en plass. Øker du antallet, rykker de på venteliste opp automatisk og får DM.
+- **Størrelse** endrer ikke poengene av seg selv. Bruk `poeng` hvis de skal endres. Nye poeng gjelder også ferdigmeldinger som ennå ikke er godkjent.
+- Endres tittel, beskrivelse eller frist, får påmeldte og de på venteliste en DM.
+- Opprykk og DM-er kjører i en bakgrunnsjobb, så det krever `lambda:InvokeFunction` (se IAM over).
+
+**`/eksport`** (bare admin)
+
+- Velg `type`: Frivillige, Oppgaver, Poenglogg eller Møter. `fra` og `til` (`ÅÅÅÅ-MM-DD`, inklusive, norsk tid) avgrenser oppgaver, poenglogg og møter. De brukes ikke for Frivillige.
+- Filen lages i en bakgrunnsjobb og sendes som vedlegg på **DM** til den som kjørte kommandoen. Er DM stengt, havner den i admin-kanalen.
+- Filen har Discord-ID-er. Sett `brukernavn:ja` for å få en kolonne med servernavn (de som har forlatt serveren, markeres).
+- Formatet er **semikolon, komma som desimaltegn og UTF-8 med BOM**, så den åpnes rett i norsk Excel. I Google Sheets: Fil → Importer → velg semikolon som skilletegn. Tekst som starter med `=`, `+`, `-` eller `@` får en apostrof foran, så regneark ikke tolker den som formel.
+- Eksporten henter data med en **Scan** av tabellen, så Lambdaen trenger `dynamodb:Scan` (lagt til i policyen over). På denne størrelsen er det billig og raskt.
+- Filer over ca. 10 MB kan ikke sendes på Discord. Avgrens da perioden.
+- Eksporten inneholder personopplysninger. Del den ikke videre, og slett den fra DM når du er ferdig.
 
 ## Kjente begrensninger i fase 1
 

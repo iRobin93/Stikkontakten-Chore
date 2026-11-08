@@ -1,4 +1,4 @@
-// Frivillig-bot for gamingsenter – Lambda-handler (fase 1–3)
+// Frivillig-bot for gamingsenter – Lambda-handler (fase 1–4)
 // Discord kaller denne via Lambda Function URL. EventBridge kaller den for planlagte jobber.
 
 import { verifyKey } from "discord-interactions";
@@ -10,6 +10,7 @@ import {
   UpdateCommand,
   DeleteCommand,
   QueryCommand,
+  ScanCommand,
   BatchGetCommand,
   TransactWriteCommand,
 } from "@aws-sdk/lib-dynamodb";
@@ -1189,6 +1190,10 @@ async function runJob(job, event = {}) {
       return runMonthly();
     case "afterApproval":
       return runAfterApproval(event);
+    case "taskEdited":
+      return runTaskEdited(event);
+    case "export":
+      return runExport(event);
     default:
       console.log("Ukjent eller ikke-implementert jobb:", job);
       return { skipped: job };
@@ -1469,6 +1474,8 @@ const COMMANDS = {
   "mal-slett": cmdMalSlett,
   møte: cmdMote,
   foreslå: cmdForesla,
+  "oppgave-rediger": cmdOppgaveRediger,
+  eksport: cmdEksport,
   takk: cmdTakk,
   ide: cmdIde,
   "ny-gjest": cmdNyGjest,
@@ -1496,7 +1503,10 @@ async function handleAutocomplete(i) {
   if (i.data.name === "ferdig") {
     const signups = await userSignups(userOf(i).id, ["active"]);
     tasks = await getTasks(signups.map((s) => s.taskId));
-  } else if (i.data.name === "oppgave-slett" && isAdmin(i)) {
+  } else if (
+    (i.data.name === "oppgave-slett" && isAdmin(i)) ||
+    (i.data.name === "oppgave-rediger" && canManage(i))
+  ) {
     const r = await db.send(
       new QueryCommand({
         TableName: TABLE,
@@ -3455,6 +3465,580 @@ async function runMonthly() {
     await releaseJob("monthly");
     throw err;
   }
+}
+
+/* ============================================================
+ * Fase 4: /oppgave-rediger
+ * ============================================================ */
+
+async function cmdOppgaveRediger(i, opts, userId) {
+  if (!canManage(i)) return ephemeral(NO_ACCESS);
+  const task = opts.oppgave ? await getTask(opts.oppgave) : null;
+  if (!task || task.status !== "open")
+    return ephemeral(
+      "Velg en åpen oppgave fra listen som dukker opp når du skriver `/oppgave-rediger`.",
+    );
+
+  const names = { "#st": "status" };
+  const values = { ":open": "open" };
+  const sets = [];
+  const removes = [];
+  const labels = [];
+  let condition = "#st = :open";
+  const setField = (field, value) => {
+    const n = sets.length;
+    names[`#f${n}`] = field;
+    values[`:v${n}`] = value;
+    sets.push(`#f${n} = :v${n}`);
+  };
+
+  const newTitle = opts.tittel ?? task.title;
+  const notifyParts = [];
+  let slotsIncreased = false;
+
+  if (opts.tittel !== undefined && opts.tittel !== task.title) {
+    setField("title", opts.tittel);
+    labels.push("tittel");
+    notifyParts.push(`tittelen er endret (nå «${newTitle}»)`);
+  }
+  if (opts.beskrivelse !== undefined && opts.beskrivelse !== task.description) {
+    setField("description", opts.beskrivelse);
+    labels.push("beskrivelse");
+    notifyParts.push("beskrivelsen er endret");
+  }
+  const size = opts["størrelse"];
+  if (size !== undefined && size !== task.size) {
+    setField("size", size);
+    labels.push(`størrelse → ${SIZES[size]}`);
+  }
+  if (opts.poeng !== undefined && opts.poeng !== task.points) {
+    setField("points", opts.poeng);
+    labels.push(`poeng → ${opts.poeng}`);
+  }
+  if (opts.plasser !== undefined && opts.plasser !== task.slots) {
+    if (opts.plasser < task.filledSlots)
+      return ephemeral(
+        `${task.filledSlots} plass${task.filledSlots === 1 ? " er" : "er er"} allerede tatt eller fullført, så antall plasser kan ikke settes lavere enn det.`,
+      );
+    setField("slots", opts.plasser);
+    labels.push(`plasser → ${opts.plasser}`);
+    names["#fs"] = "filledSlots";
+    values[":ns"] = opts.plasser; // sikrer at ingen tok en plass mens vi redigerte
+    condition += " AND #fs <= :ns";
+    slotsIncreased = opts.plasser > task.slots;
+  }
+  if (opts.frist !== undefined) {
+    const raw = opts.frist.trim().toLowerCase();
+    if (["ingen", "-", "fjern"].includes(raw)) {
+      if (task.deadline) {
+        names["#dl"] = "deadline";
+        removes.push("#dl");
+        setField("GSI1SK", task.createdAt);
+        labels.push("frist fjernet");
+        notifyParts.push("fristen er fjernet");
+      }
+    } else {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || Number.isNaN(Date.parse(raw)))
+        return ephemeral(
+          "Bruk datoformatet ÅÅÅÅ-MM-DD (f.eks. 2026-11-20), eller skriv `ingen` for å fjerne fristen.",
+        );
+      if (raw < todayOslo())
+        return ephemeral("Fristen kan ikke være i fortiden.");
+      if (raw !== task.deadline) {
+        setField("deadline", raw);
+        setField("GSI1SK", `${raw}T23:59:59`);
+        labels.push(`frist → ${fmtDate(raw)}`);
+        notifyParts.push(`ny frist ${fmtDate(raw)}`);
+      }
+    }
+  }
+  if (!labels.length)
+    return ephemeral(
+      "Ingen endringer å lagre. Fyll inn minst ett felt du vil endre.",
+    );
+
+  try {
+    await db.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: taskKey(task.id),
+        UpdateExpression:
+          `SET ${sets.join(", ")}` +
+          (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ConditionExpression: condition,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+      }),
+    );
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException")
+      return ephemeral(
+        "Oppgaven endret seg mens du redigerte (eller ble lukket). Prøv igjen.",
+      );
+    throw err;
+  }
+
+  // Beskjed til påmeldte og opprykk fra venteliste skjer i bakgrunnen (kan ta tid)
+  const notify = notifyParts.length
+    ? `✏️ Oppgaven du er påmeldt på er endret: ${notifyParts.join(", ")}. Se detaljer med \`/oppgaver\` eller \`/mine-oppgaver\`.`
+    : null;
+  let warning = "";
+  if (notify || slotsIncreased) {
+    const started = await dispatchAsync({
+      job: "taskEdited",
+      taskId: task.id,
+      promote: slotsIncreased,
+      notify,
+    });
+    if (!started)
+      warning =
+        "\n⚠️ Påmeldte og venteliste ble ikke oppdatert automatisk (bakgrunnsjobb mangler, se oppsett).";
+  }
+  const extra = [];
+  if (notify) extra.push("påmeldte får beskjed på DM");
+  if (slotsIncreased) extra.push("venteliste rykker opp automatisk");
+  if (
+    opts["størrelse"] !== undefined &&
+    opts.poeng === undefined &&
+    size !== task.size
+  )
+    extra.push(
+      `poengene er uendret (${task.points}), bruk \`poeng\` for å endre dem`,
+    );
+  return ephemeral(
+    `✅ Oppdaterte **${newTitle}**: ${labels.join(", ")}.` +
+      (extra.length ? `\n${extra.join(" · ")}` : "") +
+      warning,
+  );
+}
+
+async function runTaskEdited(p) {
+  const task = await getTask(p.taskId);
+  if (!task || task.status !== "open")
+    return { skipped: "oppgaven er ikke åpen" };
+  let promoted = 0;
+  let notified = 0;
+
+  if (p.promote) {
+    const settings = await loadSettings();
+    for (let n = 0; n < 50; n++) {
+      const fresh = await getTask(p.taskId);
+      if (!fresh || fresh.filledSlots >= fresh.slots) break;
+      const cand = await nextWaitlisted(p.taskId, settings);
+      if (!cand) break;
+      const ts = now();
+      const r = await transact([
+        signupUpdate(p.taskId, cand.userId, ["waitlist"], "active", {
+          signedUpAt: ts,
+          GSI1SK: ts,
+          GSI2SK: `SIGNUP#${ts}`,
+        }),
+        {
+          Update: {
+            TableName: TABLE,
+            Key: taskKey(p.taskId),
+            UpdateExpression: "ADD #fs :one",
+            ConditionExpression: "#st = :open AND #fs < #sl",
+            ExpressionAttributeNames: {
+              "#fs": "filledSlots",
+              "#sl": "slots",
+              "#st": "status",
+            },
+            ExpressionAttributeValues: { ":one": 1, ":open": "open" },
+          },
+        },
+      ]);
+      if (r.ok) {
+        promoted++;
+        await tryDM(cand.userId, {
+          content: `🎉 Det ble ledig plass! Du har fått plassen på **${fresh.title}**. Bruk \`/mine-oppgaver\` for å se den, og \`/ferdig\` når du er ferdig.`,
+        });
+      } else if (failedAt(r, 1)) {
+        break; // oppgaven ble full
+      }
+    }
+  }
+
+  if (p.notify) {
+    const signups = await queryAll({
+      KeyConditionExpression: "PK = :p AND begins_with(SK, :s)",
+      FilterExpression: "#st IN (:a, :w)",
+      ExpressionAttributeNames: { "#st": "status" },
+      ExpressionAttributeValues: {
+        ":p": `TASK#${p.taskId}`,
+        ":s": "SIGNUP#",
+        ":a": "active",
+        ":w": "waitlist",
+      },
+    });
+    for (const s of signups.slice(0, 50)) {
+      if (await tryDM(s.userId, { content: p.notify })) notified++;
+    }
+  }
+  return { promoted, notified };
+}
+
+/* ============================================================
+ * Fase 4: /eksport (CSV)
+ * ============================================================ */
+
+const EXPORT_LABELS = {
+  frivillige: "Frivillige",
+  oppgaver: "Oppgaver",
+  poenglogg: "Poenglogg",
+  moter: "Møter",
+};
+
+const osloStamp = (iso) =>
+  iso ? new Date(iso).toLocaleString("sv-SE", { timeZone: "Europe/Oslo" }) : "";
+
+// Norsk Excel: semikolon som skilletegn, komma som desimaltegn, UTF-8 med BOM.
+// Tekst som starter med = + - @ prefikses, så regneark ikke tolker den som formel.
+function csvCell(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "boolean") return v ? "ja" : "nei";
+  if (typeof v === "number") return String(v).replace(".", ",");
+  let s = String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return /[;"\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+const toCsv = (header, rows) =>
+  "\uFEFF" +
+  [header, ...rows].map((r) => r.map(csvCell).join(";")).join("\r\n") +
+  "\r\n";
+
+async function scanAll(params) {
+  const items = [];
+  let ExclusiveStartKey;
+  do {
+    const r = await db.send(
+      new ScanCommand({ TableName: TABLE, ...params, ExclusiveStartKey }),
+    );
+    items.push(...(r.Items ?? []));
+    ExclusiveStartKey = r.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return items;
+}
+
+// Henter alle elementer av én type, evt. avgrenset på et tidsfelt (ISO-strenger)
+function scanEntity(entity, { field, fromIso, toIso } = {}) {
+  const names = {};
+  const values = { ":e": entity };
+  let filter = "entity = :e";
+  if (field && fromIso) {
+    names["#t"] = field;
+    values[":f"] = fromIso;
+    filter += " AND #t >= :f";
+  }
+  if (field && toIso) {
+    names["#t"] = field;
+    values[":t"] = toIso;
+    filter += " AND #t < :t";
+  }
+  return scanAll({
+    FilterExpression: filter,
+    ...(Object.keys(names).length ? { ExpressionAttributeNames: names } : {}),
+    ExpressionAttributeValues: values,
+  });
+}
+
+async function buildExport(type, { fraIso, toIso }) {
+  const range = { fromIso: fraIso, toIso };
+  if (type === "frivillige") {
+    const [profiles, approved] = await Promise.all([
+      scanAll({
+        FilterExpression: "SK = :s",
+        ExpressionAttributeValues: { ":s": "PROFILE" },
+      }),
+      scanAll({
+        FilterExpression: "entity = :e AND #st = :a",
+        ExpressionAttributeNames: { "#st": "status" },
+        ExpressionAttributeValues: { ":e": "COMPLETION", ":a": "approved" },
+      }),
+    ]);
+    const done = new Map();
+    for (const c of approved) done.set(c.userId, (done.get(c.userId) ?? 0) + 1);
+    const rows = profiles
+      .map((p) => ({ ...p, userId: p.PK.replace("USER#", "") }))
+      .sort((a, b) => (b.totalEarned ?? 0) - (a.totalEarned ?? 0))
+      .map((p) => [
+        p.userId,
+        p.points ?? 0,
+        p.totalEarned ?? 0,
+        LEVELS.find((l) => l.key === p.level)?.name ?? "",
+        p.attendanceStreak ?? 0,
+        p.lastStreakWeek ?? "",
+        done.get(p.userId) ?? 0,
+        osloStamp(p.createdAt),
+      ]);
+    return {
+      header: [
+        "discord_id",
+        "poeng",
+        "totalt_opptjent",
+        "nivå",
+        "streak_uker",
+        "siste_streak_uke",
+        "fullførte_oppgaver",
+        "opprettet",
+      ],
+      rows,
+      userCol: 0,
+    };
+  }
+
+  if (type === "oppgaver") {
+    const tasks = (
+      await scanEntity("TASK", { field: "createdAt", ...range })
+    ).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return {
+      header: [
+        "id",
+        "tittel",
+        "størrelse",
+        "poeng",
+        "plasser",
+        "tatt",
+        "fullført",
+        "status",
+        "frist",
+        "opprettet",
+        "mal_id",
+        "opprettet_av",
+      ],
+      rows: tasks.map((t) => [
+        t.id,
+        t.title,
+        SIZES[t.size] ?? t.size,
+        t.points,
+        t.slots,
+        t.filledSlots,
+        t.doneCount ?? 0,
+        t.status,
+        t.deadline ?? "",
+        osloStamp(t.createdAt),
+        t.templateId ?? "",
+        t.createdBy ?? "",
+      ]),
+      userCol: null,
+    };
+  }
+
+  if (type === "poenglogg") {
+    const logs = (
+      await scanEntity("LOG", { field: "createdAt", ...range })
+    ).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return {
+      header: [
+        "tidspunkt",
+        "discord_id",
+        "poeng",
+        "grunnlag",
+        "multiplikator",
+        "begrunnelse",
+        "gitt_av",
+        "oppgave_id",
+      ],
+      rows: logs.map((l) => [
+        osloStamp(l.createdAt),
+        l.PK.replace("USER#", ""),
+        l.delta,
+        l.basePoints ?? l.delta,
+        l.multiplier ?? 1,
+        l.reason ?? "",
+        l.givenBy ?? "",
+        l.taskId ?? "",
+      ]),
+      userCol: 1,
+    };
+  }
+
+  // møter
+  const meetings = (
+    await scanEntity("MEETING", { field: "startsAt", ...range })
+  ).sort((a, b) => a.startsAt.localeCompare(b.startsAt));
+  return {
+    header: ["id", "tittel", "start", "plasser", "påmeldte", "møtte_opp"],
+    rows: meetings.map((m) => [
+      m.id,
+      m.title,
+      osloStamp(m.startsAt),
+      m.slots,
+      m.filledSlots,
+      m.attendedCount ?? 0,
+    ]),
+    userCol: null,
+  };
+}
+
+async function lookupNames(userIds) {
+  const guild = process.env.GUILD_ID;
+  const out = new Map();
+  if (!guild) return out;
+  const ids = [...new Set(userIds)].slice(0, 500);
+  for (const part of chunk(ids, 5)) {
+    await Promise.all(
+      part.map(async (id) => {
+        try {
+          const m = await discord(`/guilds/${guild}/members/${id}`);
+          out.set(id, m.nick ?? m.user?.global_name ?? m.user?.username ?? "");
+        } catch (err) {
+          out.set(id, err.status === 404 ? "(forlatt serveren)" : "");
+        }
+      }),
+    );
+  }
+  return out;
+}
+
+// Sender til brukeren på DM. Er DM stengt, havner filen i admin-kanalen.
+async function deliverToRequester(p, content, csv, filename) {
+  const makeForm = (text) => {
+    const form = new FormData();
+    form.append(
+      "payload_json",
+      JSON.stringify({
+        content: text,
+        ...(csv ? { attachments: [{ id: 0, filename }] } : {}),
+        allowed_mentions: { users: [p.requesterId] },
+      }),
+    );
+    if (csv)
+      form.append(
+        "files[0]",
+        new Blob([csv], { type: "text/csv; charset=utf-8" }),
+        filename,
+      );
+    return form;
+  };
+  try {
+    const ch = await discord("/users/@me/channels", {
+      method: "POST",
+      body: { recipient_id: p.requesterId },
+    });
+    await discord(`/channels/${ch.id}/messages`, {
+      method: "POST",
+      form: makeForm(content),
+      timeout: 30000,
+    });
+    return "dm";
+  } catch (err) {
+    console.warn("Kunne ikke sende eksport på DM:", err.message);
+    if (!p.adminChannelId) throw err;
+    await discord(`/channels/${p.adminChannelId}/messages`, {
+      method: "POST",
+      form: makeForm(
+        `<@${p.requesterId}> DM var stengt, så eksporten ligger her:\n${content}`,
+      ),
+      timeout: 30000,
+    });
+    return "kanal";
+  }
+}
+
+async function runExport(p) {
+  try {
+    const fraIso = p.fra ? osloLocalToIso(p.fra, "00:00") : undefined;
+    const toIso = p.til
+      ? osloLocalToIso(addDays(p.til, 1), "00:00")
+      : undefined; // «til» er inklusiv
+    const { header, rows, userCol } = await buildExport(p.type, {
+      fraIso,
+      toIso,
+    });
+
+    if (!rows.length) {
+      await deliverToRequester(
+        p,
+        `📤 **${EXPORT_LABELS[p.type]}**: ingen rader å eksportere for valgt periode.`,
+      );
+      return { rows: 0 };
+    }
+
+    let head = header;
+    let body = rows;
+    if (p.names && userCol !== null) {
+      const names = await lookupNames(rows.map((r) => r[userCol]));
+      head = [
+        ...header.slice(0, userCol + 1),
+        "brukernavn",
+        ...header.slice(userCol + 1),
+      ];
+      body = rows.map((r) => [
+        ...r.slice(0, userCol + 1),
+        names.get(r[userCol]) ?? "",
+        ...r.slice(userCol + 1),
+      ]);
+    }
+
+    const csv = toCsv(head, body);
+    if (Buffer.byteLength(csv) > 9.5 * 1024 * 1024) {
+      await deliverToRequester(
+        p,
+        `⚠️ **${EXPORT_LABELS[p.type]}**: filen ble for stor for Discord (over ca. 10 MB). Avgrens perioden med \`fra\` og \`til\`.`,
+      );
+      return { rows: rows.length, tooBig: true };
+    }
+
+    const period =
+      p.fra || p.til ? ` (${p.fra ?? "start"} til ${p.til ?? "nå"})` : "";
+    const filename = `eksport-${p.type}-${todayOslo()}.csv`;
+    const where = await deliverToRequester(
+      p,
+      `📤 **Eksport: ${EXPORT_LABELS[p.type]}**${period} · ${rows.length} rader\nSemikolon-separert UTF-8, åpnes direkte i Excel. Inneholder personopplysninger, så ikke del den videre.`,
+      csv,
+      filename,
+    );
+    return { rows: rows.length, where };
+  } catch (err) {
+    console.error("Eksport feilet:", err);
+    const hint = /AccessDenied|not authorized/i.test(String(err.message))
+      ? " Lambdaen mangler trolig tillatelsen `dynamodb:Scan` (se SETUP.md)."
+      : "";
+    await deliverToRequester(
+      p,
+      `⚠️ Eksporten feilet: ${String(err.message).slice(0, 200)}.${hint}`,
+    ).catch(() => {});
+    return { error: String(err.message) };
+  }
+}
+
+async function cmdEksport(i, opts, userId) {
+  if (!isAdmin(i)) return ephemeral(NO_ACCESS);
+  for (const key of ["fra", "til"]) {
+    if (
+      opts[key] &&
+      (!/^\d{4}-\d{2}-\d{2}$/.test(opts[key]) ||
+        Number.isNaN(Date.parse(opts[key])))
+    )
+      return ephemeral(
+        `\`${key}\` må skrives som ÅÅÅÅ-MM-DD, f.eks. 2026-11-01.`,
+      );
+  }
+  if (opts.fra && opts.til && opts.fra > opts.til)
+    return ephemeral("`fra` kan ikke være etter `til`.");
+
+  const settings = await loadSettings();
+  const started = await dispatchAsync({
+    job: "export",
+    type: opts.type,
+    fra: opts.fra,
+    til: opts.til,
+    names: Boolean(opts.brukernavn),
+    requesterId: userId,
+    adminChannelId: settings.adminChannelId,
+  });
+  if (!started)
+    return ephemeral(
+      "Jeg klarte ikke å starte eksporten. Sjekk at Lambdaen har tillatelsen `lambda:InvokeFunction` (se SETUP.md).",
+    );
+  const note =
+    opts.type === "frivillige" && (opts.fra || opts.til)
+      ? "\n_Merk: perioden brukes ikke for «Frivillige»._"
+      : "";
+  return ephemeral(
+    `📤 Eksporten **${EXPORT_LABELS[opts.type]}** lages nå. Filen kommer på DM til deg om litt (eller i admin-kanalen hvis DM er stengt).${note}`,
+  );
 }
 
 /* ============================================================
