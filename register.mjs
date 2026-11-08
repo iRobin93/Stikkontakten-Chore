@@ -4,6 +4,7 @@
 const STRING = 3;
 const INTEGER = 4;
 const BOOLEAN = 5;
+const CHANNEL = 7;
 const USER = 6;
 const ATTACHMENT = 11;
 
@@ -354,7 +355,7 @@ const commands = [
       {
         type: INTEGER,
         name: "plasser",
-        description: "Antall frivillig-plasser (standard 20)",
+        description: "Maks antall plasser (standard: ubegrenset)",
         min_value: 1,
         max_value: 200,
       },
@@ -418,6 +419,79 @@ const commands = [
   {
     name: "frivillig-synk",
     description: "Gi Frivillig-rollen til alle som allerede har poeng (admin)",
+  },
+  {
+    name: "møtemal-ny",
+    description: "Lag mal for gjentakende møte (admin/leder)",
+    options: [
+      {
+        type: STRING,
+        name: "tittel",
+        description: "Hva er møtet?",
+        required: true,
+        max_length: 80,
+      },
+      {
+        type: STRING,
+        name: "klokkeslett",
+        description: "Starttid som TT:MM (norsk tid)",
+        required: true,
+      },
+      {
+        type: STRING,
+        name: "intervall",
+        description: "Hvor ofte?",
+        required: true,
+        choices: [
+          { name: "Hver uke", value: "weekly" },
+          { name: "Annenhver uke", value: "biweekly" },
+          { name: "Hver måned", value: "monthly" },
+        ],
+      },
+      {
+        type: INTEGER,
+        name: "dag",
+        description:
+          "Ukedag 1-7 (1 = mandag) for ukentlig. Ellers dag i måneden 1-28",
+        required: true,
+        min_value: 1,
+        max_value: 28,
+      },
+      {
+        type: INTEGER,
+        name: "plasser",
+        description: "Maks antall plasser (standard: ubegrenset)",
+        min_value: 1,
+        max_value: 200,
+      },
+      {
+        type: CHANNEL,
+        name: "kanal",
+        description: "Kanal møtet legges ut i (standard: denne)",
+        channel_types: [0, 5],
+      },
+      {
+        type: INTEGER,
+        name: "dagerfor",
+        description: "Legg ut møtet så mange dager før (standard 3)",
+        min_value: 0,
+        max_value: 14,
+      },
+    ],
+  },
+  { name: "møtemal-liste", description: "Se alle møtemaler (admin/leder)" },
+  {
+    name: "møtemal-slett",
+    description: "Slett en møtemal (admin)",
+    options: [
+      {
+        type: STRING,
+        name: "mal",
+        description: "Hvilken møtemal?",
+        required: true,
+        autocomplete: true,
+      },
+    ],
   },
   {
     name: "innstillinger",

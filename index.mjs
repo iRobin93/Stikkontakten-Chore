@@ -1,4 +1,4 @@
-// Frivillig-bot for gamingsenter – Lambda-handler (fase 1–5)
+// Frivillig-bot for gamingsenter – Lambda-handler (fase 1–6)
 // Discord kaller denne via Lambda Function URL. EventBridge kaller den for planlagte jobber.
 
 import { verifyKey } from "discord-interactions";
@@ -1506,6 +1506,9 @@ const COMMANDS = {
   "oppgave-rediger": cmdOppgaveRediger,
   eksport: cmdEksport,
   "frivillig-knapp": cmdFrivilligKnapp,
+  "møtemal-ny": cmdMoteMalNy,
+  "møtemal-liste": cmdMoteMalListe,
+  "møtemal-slett": cmdMoteMalSlett,
   "frivillig-synk": cmdFrivilligSynk,
   takk: cmdTakk,
   ide: cmdIde,
@@ -1552,6 +1555,9 @@ async function handleAutocomplete(i) {
 
   if (i.data.name === "mal-slett" && isAdmin(i)) {
     tasks = await listTemplates();
+  }
+  if (i.data.name === "møtemal-slett" && isAdmin(i)) {
+    tasks = await listMeetingTemplates();
   }
   if (i.data.name === "innstillinger") {
     const settingChoices = isAdmin(i)
@@ -2071,8 +2077,28 @@ async function runNightly() {
   for (const tpl of await listTemplates()) {
     if (await spawnFromTemplate(tpl, today)) created++;
   }
+  let meetings = 0;
+  const failed = [];
+  for (const tpl of await listMeetingTemplates()) {
+    const r = await spawnMeetingFromTemplate(tpl);
+    if (r?.meeting) meetings++;
+    else if (r?.error)
+      failed.push(
+        `• **${tpl.title}** i <#${tpl.channelId}>: ${channelErrorHint(r.error)}`,
+      );
+  }
+  if (failed.length && settings.adminChannelId) {
+    await postToChannel(settings.adminChannelId, {
+      content:
+        `⚠️ Jeg fikk ikke lagt ut møter fra mal i natt. Jeg prøver igjen i morgen.\n${failed.join("\n")}`.slice(
+          0,
+          1990,
+        ),
+      allowed_mentions: { parse: [] },
+    }).catch(() => {});
+  }
   const alerts = await untakenAlerts(settings);
-  return { created, alerts };
+  return { created, meetings, alerts };
 }
 
 async function runWeekly() {
@@ -2245,7 +2271,7 @@ function renderMeeting(m) {
         title: `📅 ${m.title}`,
         description:
           `🕒 <t:${ts}:F> (<t:${ts}:R>)\n` +
-          `👥 ${m.filledSlots} av ${m.slots} plasser er tatt\n` +
+          `👥 ${m.slots == null ? `${m.filledSlots} påmeldt` : `${m.filledSlots} av ${m.slots} plasser er tatt`}\n` +
           `📍 ${m.attendedCount ?? 0} har sjekket inn`,
         color: 0x5865f2,
         footer: {
@@ -2291,7 +2317,7 @@ async function cmdMote(i, opts, userId) {
     entity: "MEETING",
     id,
     title: opts.tittel,
-    slots: opts.plasser ?? 20,
+    slots: opts.plasser ?? null, // null = ubegrenset
     filledSlots: 0,
     attendedCount: 0,
     startsAt,
@@ -2332,9 +2358,10 @@ async function meetingJoin(meetingId, userId) {
         TableName: TABLE,
         Key: meetingKey(meetingId),
         UpdateExpression: "ADD #fs :one",
-        ConditionExpression: "#fs < #sl",
+        ConditionExpression:
+          "attribute_not_exists(#sl) OR #sl = :nul OR #fs < #sl",
         ExpressionAttributeNames: { "#fs": "filledSlots", "#sl": "slots" },
-        ExpressionAttributeValues: { ":one": 1 },
+        ExpressionAttributeValues: { ":one": 1, ":nul": null },
       },
     },
     {
@@ -4683,6 +4710,223 @@ async function runGrantRole(p) {
     ).catch(() => {});
     return { error: String(err.message) };
   }
+}
+
+/* ============================================================
+ * Fase 6: møtemaler (gjentakende møter som legges ut automatisk)
+ * ============================================================ */
+
+const meetingTemplateKey = (id) => ({
+  PK: `MEETINGTEMPLATE#${id}`,
+  SK: "META",
+});
+const listMeetingTemplates = () =>
+  queryAll({
+    IndexName: "GSI1",
+    KeyConditionExpression: "GSI1PK = :p",
+    ExpressionAttributeValues: { ":p": "MEETINGTEMPLATES" },
+  });
+
+const daysBetween = (a, b) =>
+  Math.round((Date.parse(b) - Date.parse(a)) / 86400000);
+
+// Første forekomst på eller etter datoen `from` (norsk dato, ÅÅÅÅ-MM-DD)
+function nextOccurrence(tpl, from) {
+  if (tpl.interval === "weekly")
+    return addDays(from, (tpl.anchorDay - isoWeekday(from) + 7) % 7);
+  if (tpl.interval === "biweekly") {
+    const gap = daysBetween(tpl.startDate, from);
+    return gap <= 0
+      ? tpl.startDate
+      : addDays(tpl.startDate, Math.ceil(gap / 14) * 14);
+  }
+  const [y, m] = from.split("-").map(Number);
+  const thisMonth = `${y}-${pad(m)}-${pad(tpl.anchorDay)}`;
+  if (thisMonth >= from) return thisMonth;
+  return `${m === 12 ? y + 1 : y}-${pad(m === 12 ? 1 : m + 1)}-${pad(tpl.anchorDay)}`;
+}
+
+// Neste møte som ikke har startet ennå
+function upcomingOccurrence(tpl) {
+  const occ = nextOccurrence(tpl, todayOslo());
+  return Date.parse(osloLocalToIso(occ, tpl.time)) <= Date.now()
+    ? nextOccurrence(tpl, addDays(occ, 1))
+    : occ;
+}
+
+function describeMeetingSchedule(t) {
+  if (t.interval === "weekly")
+    return `hver ${WEEKDAYS[t.anchorDay - 1]} kl. ${t.time}`;
+  if (t.interval === "biweekly")
+    return `annenhver ${WEEKDAYS[t.anchorDay - 1]} kl. ${t.time}`;
+  return `den ${t.anchorDay}. hver måned kl. ${t.time}`;
+}
+
+function channelErrorHint(err) {
+  if (err.status === 403)
+    return "boten mangler tilgang i kanalen. Den trenger *Se kanal*, *Send meldinger* og *Bygg inn lenker* der.";
+  if (err.status === 404)
+    return "kanalen finnes ikke lenger. Slett malen og lag den på nytt.";
+  return `Discord svarte ${err.status ?? "med en feil"}.`;
+}
+
+// Legger ut neste møte hvis det er innenfor «legg ut så mange dager før». Trygt å kjøre flere ganger.
+// Gir null (ikke aktuelt), { meeting } (lagt ut) eller { error } (kunne ikke poste, rullet tilbake).
+async function spawnMeetingFromTemplate(tpl) {
+  const today = todayOslo();
+  const occ = upcomingOccurrence(tpl);
+  if (daysBetween(today, occ) > (tpl.leadDays ?? 3)) return null;
+  if (tpl.lastOccurrence && tpl.lastOccurrence >= occ) return null;
+
+  const id = randomBytes(4).toString("hex");
+  const meeting = {
+    ...meetingKey(id),
+    entity: "MEETING",
+    id,
+    title: tpl.title,
+    slots: tpl.slots,
+    filledSlots: 0,
+    attendedCount: 0,
+    startsAt: osloLocalToIso(occ, tpl.time),
+    createdBy: "system",
+    createdAt: now(),
+    templateId: tpl.id,
+  };
+  const r = await transact([
+    {
+      Update: {
+        TableName: TABLE,
+        Key: meetingTemplateKey(tpl.id),
+        UpdateExpression: "SET lastOccurrence = :o",
+        ConditionExpression:
+          "attribute_not_exists(lastOccurrence) OR lastOccurrence < :o",
+        ExpressionAttributeValues: { ":o": occ },
+      },
+    },
+    {
+      Put: {
+        TableName: TABLE,
+        Item: meeting,
+        ConditionExpression: "attribute_not_exists(PK)",
+      },
+    },
+  ]);
+  if (!r.ok) return null; // noen andre rakk det først
+
+  try {
+    await postToChannel(tpl.channelId, renderMeeting(meeting));
+    return { meeting, occ };
+  } catch (err) {
+    console.error("Kunne ikke poste møte fra mal", tpl.id, err.message);
+    await db
+      .send(new DeleteCommand({ TableName: TABLE, Key: meetingKey(id) }))
+      .catch(() => {});
+    await db
+      .send(
+        new UpdateCommand({
+          TableName: TABLE,
+          Key: meetingTemplateKey(tpl.id),
+          UpdateExpression: "REMOVE lastOccurrence",
+          ConditionExpression: "lastOccurrence = :o",
+          ExpressionAttributeValues: { ":o": occ },
+        }),
+      )
+      .catch(() => {});
+    return { error: err, occ };
+  }
+}
+
+async function cmdMoteMalNy(i, opts, userId) {
+  if (!canManage(i)) return ephemeral(NO_ACCESS);
+  const interval = opts.intervall;
+  const dag = opts.dag;
+  if (interval !== "monthly" && dag > 7)
+    return ephemeral(
+      "For ukentlige og annenhver-uke-møter må `dag` være 1–7 (1 = mandag, 7 = søndag).",
+    );
+  const m = /^([01]?\d|2[0-3])[:.]([0-5]\d)$/.exec(opts.klokkeslett.trim());
+  if (!m)
+    return ephemeral("Bruk klokkeslett som TT:MM, f.eks. 18:30 (norsk tid).");
+  const time = `${pad(Number(m[1]))}:${m[2]}`;
+
+  let startDate;
+  if (interval === "biweekly") {
+    const today = todayOslo();
+    startDate = addDays(today, (dag - isoWeekday(today) + 7) % 7);
+    if (Date.parse(osloLocalToIso(startDate, time)) <= Date.now())
+      startDate = addDays(startDate, 7);
+  }
+
+  const id = randomBytes(4).toString("hex");
+  const tpl = {
+    ...meetingTemplateKey(id),
+    entity: "MEETINGTEMPLATE",
+    id,
+    title: opts.tittel,
+    time,
+    interval,
+    anchorDay: dag,
+    startDate,
+    slots: opts.plasser ?? null, // null = ubegrenset
+    leadDays: opts.dagerfor ?? 3,
+    channelId: opts.kanal ?? i.channel_id,
+    createdBy: userId,
+    createdAt: now(),
+    GSI1PK: "MEETINGTEMPLATES",
+    GSI1SK: id,
+  };
+  await db.send(
+    new PutCommand({
+      TableName: TABLE,
+      Item: tpl,
+      ConditionExpression: "attribute_not_exists(PK)",
+    }),
+  );
+
+  const spawned = await spawnMeetingFromTemplate(tpl);
+  const head = `✅ Møtemal **${tpl.title}** opprettet (${describeMeetingSchedule(tpl)}, i <#${tpl.channelId}>).`;
+  if (spawned?.meeting)
+    return ephemeral(`${head}\nNeste møte er allerede lagt ut i kanalen.`);
+  if (spawned?.error)
+    return ephemeral(
+      `${head}\n⚠️ Jeg fikk ikke lagt ut neste møte: ${channelErrorHint(spawned.error)} Jeg prøver igjen i natt.`,
+    );
+  const next = upcomingOccurrence(tpl);
+  return ephemeral(
+    `${head}\nNeste møte er ${fmtDate(next)}, og det legges ut automatisk ${tpl.leadDays} dager før.`,
+  );
+}
+
+async function cmdMoteMalListe(i) {
+  if (!canManage(i)) return ephemeral(NO_ACCESS);
+  const templates = await listMeetingTemplates();
+  if (!templates.length)
+    return ephemeral("Ingen møtemaler ennå. Lag en med `/møtemal-ny`.");
+  const lines = templates.map(
+    (t) =>
+      `• **${t.title}** · ${describeMeetingSchedule(t)} · <#${t.channelId}> · ${t.slots == null ? "ubegrenset" : `${t.slots} plasser`} · legges ut ${t.leadDays} dager før · neste: ${fmtDate(upcomingOccurrence(t))}`,
+  );
+  return ephemeral(`**Møtemaler**\n${lines.join("\n")}`.slice(0, 1990));
+}
+
+async function cmdMoteMalSlett(i, opts) {
+  if (!isAdmin(i)) return ephemeral(NO_ACCESS);
+  try {
+    await db.send(
+      new DeleteCommand({
+        TableName: TABLE,
+        Key: meetingTemplateKey(opts.mal),
+        ConditionExpression: "attribute_exists(PK)",
+      }),
+    );
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException")
+      return ephemeral("Fant ikke den malen. Velg en fra listen.");
+    throw err;
+  }
+  return ephemeral(
+    "🗑️ Møtemalen er slettet. Møter som allerede er lagt ut, blir liggende.",
+  );
 }
 
 /* ============================================================

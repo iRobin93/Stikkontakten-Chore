@@ -1,4 +1,4 @@
-# Oppsett – fase 1 til 5
+# Oppsett – fase 1 til 6
 
 ## 1. DynamoDB-tabell (manuelt i konsollen)
 
@@ -222,9 +222,23 @@ Boten kan ikke lese emoji-reaksjoner (det krever en permanent tilkobling til Dis
 - Får boten ikke gitt rollen, ser brukeren en høflig beskjed, og admin-kanalen får en melding med årsak (mangler _Manage Roles_, eller rollen ligger over botens).
 - `/innstillinger … verdi:ingen` fjerner innstillingen og slår rollekravet av igjen.
 
+## Fase 6: møtemaler
+
+Gjentakende møter som legges ut automatisk, som oppgavemaler.
+
+- `/møtemal-ny tittel klokkeslett intervall dag` – intervall: hver uke, annenhver uke eller hver måned. `dag` er ukedag 1–7 (1 = mandag) for uke-maler, og dag i måneden 1–28 for månedlige. Valgfritt: `plasser` (standard: ubegrenset), `kanal` (standard: kanalen du skriver i) og `dagerfor` (legg ut så mange dager før, standard 3).
+- `/møtemal-liste` viser malene og neste dato. `/møtemal-slett` (admin) fjerner en mal. Møter som allerede er lagt ut, blir liggende.
+- **Nattjobben** (`nightly`) legger ut neste møte når det er innenfor «dager før». Det legges ut bare én gang per møtedato. Møtemeldingen er den vanlige med _Meld meg på_, _Meld meg av_ og _Jeg er her_.
+- Lager du en mal og neste møte allerede er innenfor tidsrommet, legges det ut med en gang.
+- **Annenhver uke** teller fra første forekomst etter at malen ble laget.
+- Kan ikke boten poste i kanalen (mangler _Se kanal_, _Send meldinger_, _Bygg inn lenker_), får admin-kanalen en melding, og boten prøver igjen neste natt.
+- Ingen nye indekser, miljøvariabler eller IAM-rettigheter trengs. Nattjobben må være satt opp (se punkt 4).
+
 ## Kjente begrensninger i fase 1
 
 - Bilder i `/ferdig` lagres som Discord-CDN-lenker, som utløper. Bildet i admin-meldingen kan derfor bli borte etter en stund. Ved godkjenning ber botten Discord om en fersk lenke før bildet postes på nytt i bildekanalen.
 - Alt svares direkte innen 3 sekunder. Lambda kan ikke fortsette arbeid etter at svaret er sendt, så deferred response (type 5) brukes først når noe blir tungt (da via asynkron self-invoke).
 - `/oppgave-rediger` er ikke med ennå.
 - Poengjusteringer endrer både saldo og `totalEarned`, siden det ikke finnes noe poengforbruk i fase 1.
+
+**Møteplasser:** møter har ubegrenset antall plasser som standard, så alle med Frivillig-rollen kan melde seg på. Sett `plasser` på `/møte` eller `/møtemal-ny` hvis du vil ha et tak. Eksisterende møter beholder sin grense.
