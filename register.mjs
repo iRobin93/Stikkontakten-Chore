@@ -404,6 +404,22 @@ const commands = [
     ],
   },
   {
+    name: "frivillig-knapp",
+    description: "Legg ut «Bli frivillig»-knappen i denne kanalen (admin)",
+    options: [
+      {
+        type: STRING,
+        name: "tekst",
+        description: "Egen tekst i meldingen (valgfri)",
+        max_length: 800,
+      },
+    ],
+  },
+  {
+    name: "frivillig-synk",
+    description: "Gi Frivillig-rollen til alle som allerede har poeng (admin)",
+  },
+  {
     name: "innstillinger",
     description: "Se eller endre innstillinger (admin)",
     options: [

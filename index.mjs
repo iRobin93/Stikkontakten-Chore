@@ -1,4 +1,4 @@
-// Frivillig-bot for gamingsenter – Lambda-handler (fase 1–4)
+// Frivillig-bot for gamingsenter – Lambda-handler (fase 1–5)
 // Discord kaller denne via Lambda Function URL. EventBridge kaller den for planlagte jobber.
 
 import { verifyKey } from "discord-interactions";
@@ -68,6 +68,8 @@ const DEFAULT_SETTINGS = {
   // Toppliste og kanaler
   leaderboardEnabled: 0, // 1 = på
   photoChannelId: process.env.PHOTO_CHANNEL_ID ?? null,
+  volunteerRoleId: process.env.VOLUNTEER_ROLE_ID ?? null, // satt = man må ha rollen for å samle poeng
+  volunteerChannelId: null, // settes automatisk av /frivillig-knapp
   photoMaxMb: 9.5, // største bilde boten laster opp på nytt (Discord: ca. 10 uten serverboost)
   shoutoutChannelId: process.env.SHOUTOUT_CHANNEL_ID ?? null,
 };
@@ -178,6 +180,14 @@ const SETTING_DEFS = {
     label: "Toppliste (1 = på, 0 = av)",
   },
   photoChannelId: { type: "id", label: "Bildekanal (#før-og-etter)" },
+  volunteerRoleId: {
+    type: "id",
+    label: "Discord-rolle: Frivillig (påkrevd for å samle poeng)",
+  },
+  volunteerChannelId: {
+    type: "id",
+    label: "Kanal med «Bli frivillig»-knappen (settes automatisk)",
+  },
   photoMaxMb: {
     type: "float",
     min: 1,
@@ -859,6 +869,8 @@ async function dropSignup(taskId, userId, { via } = {}) {
  * ============================================================ */
 
 async function cmdFerdig(i, opts, userId) {
+  const gate = await loadSettings();
+  if (!isVolunteer(i, gate)) return notVolunteerReply(gate);
   const taskId = opts.oppgave;
   const signup = taskId ? await getSignup(taskId, userId) : null;
   if (!signup)
@@ -1195,6 +1207,8 @@ async function runJob(job, event = {}) {
       return runTaskEdited(event);
     case "export":
       return runExport(event);
+    case "grantRole":
+      return runGrantRole(event);
     default:
       console.log("Ukjent eller ikke-implementert jobb:", job);
       return { skipped: job };
@@ -1443,20 +1457,34 @@ async function cmdInnstillinger(i, opts) {
     if (value < def.min || value > def.max)
       return ephemeral(`Verdien må være mellom ${def.min} og ${def.max}.`);
   } else {
-    const m = opts.verdi.match(/^(?:<#)?(\d{5,25})>?$/); // lim inn ID eller #kanal
-    if (!m) return ephemeral("Oppgi en kanal-ID (eller lim inn #kanal).");
-    value = m[1];
+    if (
+      ["ingen", "-", "av", "fjern"].includes(opts.verdi.trim().toLowerCase())
+    ) {
+      value = null; // fjerner innstillingen (standardverdi/miljøvariabel brukes igjen)
+    } else {
+      const m = opts.verdi.trim().match(/^(?:<[#@&]*)?(\d{5,25})>?$/); // ID, #kanal eller @rolle
+      if (!m)
+        return ephemeral(
+          "Oppgi en ID (eller lim inn #kanal / @rolle). Skriv `ingen` for å fjerne innstillingen.",
+        );
+      value = m[1];
+    }
   }
 
   await db.send(
     new UpdateCommand({
       TableName: TABLE,
       Key: { PK: "CONFIG", SK: "SETTINGS" },
-      UpdateExpression: "SET #k = :v, updatedAt = :ts",
+      UpdateExpression:
+        value === null
+          ? "REMOVE #k SET updatedAt = :ts"
+          : "SET #k = :v, updatedAt = :ts",
       ExpressionAttributeNames: { "#k": opts.innstilling },
-      ExpressionAttributeValues: { ":v": value, ":ts": now() },
+      ExpressionAttributeValues:
+        value === null ? { ":ts": now() } : { ":v": value, ":ts": now() },
     }),
   );
+  if (value === null) return ephemeral(`✅ ${def.label}: fjernet.`);
   return ephemeral(`✅ ${def.label}: **${show(opts.innstilling, value)}**`);
 }
 
@@ -1477,6 +1505,8 @@ const COMMANDS = {
   foreslå: cmdForesla,
   "oppgave-rediger": cmdOppgaveRediger,
   eksport: cmdEksport,
+  "frivillig-knapp": cmdFrivilligKnapp,
+  "frivillig-synk": cmdFrivilligSynk,
   takk: cmdTakk,
   ide: cmdIde,
   "ny-gjest": cmdNyGjest,
@@ -1554,6 +1584,8 @@ async function handleComponent(i) {
 
   switch (action) {
     case "signup": {
+      const gate = await loadSettings();
+      if (!isVolunteer(i, gate)) return notVolunteerReply(gate);
       const notice = await signUp(taskId, user.id);
       return updateMessage(await renderTaskList(user.id, notice));
     }
@@ -1665,6 +1697,10 @@ async function handleComponent(i) {
     case "mt_join":
     case "mt_leave":
     case "mt_here": {
+      if (action !== "mt_leave") {
+        const gate = await loadSettings();
+        if (!isVolunteer(i, gate)) return notVolunteerReply(gate);
+      }
       const fn = {
         mt_join: meetingJoin,
         mt_leave: meetingLeave,
@@ -1685,6 +1721,12 @@ async function handleComponent(i) {
       }
       return ephemeral(notice);
     }
+
+    case "join_vol":
+      return joinVolunteer(i);
+
+    case "leave_vol":
+      return leaveVolunteer(i);
 
     case "idea_use":
       if (!canManage(i)) return ephemeral(NO_ACCESS);
@@ -2980,6 +3022,16 @@ async function cmdTakk(i, opts, userId) {
     return ephemeral("Boter trenger ingen poeng 🤖");
 
   const settings = await loadSettings();
+  if (!isVolunteer(i, settings)) return notVolunteerReply(settings);
+  if (
+    settings.volunteerRoleId &&
+    !(i.data.resolved?.members?.[target]?.roles ?? []).includes(
+      settings.volunteerRoleId,
+    )
+  )
+    return ephemeral(
+      `<@${target}> er ikke frivillig ennå, så hen kan ikke få poeng. Hen kan trykke på «Bli frivillig» 🙂`,
+    );
   const week = isoWeekKey(todayOslo());
   const award = await computeAward(target, settings.thanksPoints, {
     attendance: false,
@@ -3042,6 +3094,7 @@ async function cmdTakk(i, opts, userId) {
 
 async function cmdIde(i, opts, userId) {
   const settings = await loadSettings();
+  if (!isVolunteer(i, settings)) return notVolunteerReply(settings);
   if (!settings.adminChannelId)
     return ephemeral(
       "Admin-kanalen er ikke satt opp ennå. Be en admin bruke `/innstillinger`.",
@@ -3206,6 +3259,7 @@ async function ideaArchive(i, ideaId) {
 
 async function cmdNyGjest(i, opts, userId) {
   const settings = await loadSettings();
+  if (!isVolunteer(i, settings)) return notVolunteerReply(settings);
   if (!settings.adminChannelId)
     return ephemeral(
       "Admin-kanalen er ikke satt opp ennå. Be en admin bruke `/innstillinger`.",
@@ -4409,6 +4463,226 @@ async function cmdEksport(i, opts, userId) {
   return ephemeral(
     `📤 Eksporten **${EXPORT_LABELS[opts.type]}** lages nå. ${(opts.format ?? "xlsx") === "xlsx" ? "Excel-filen kommer" : opts.type === "alt" ? "Filene kommer" : "Filen kommer"} på DM til deg om litt (eller i admin-kanalen hvis DM er stengt).${note}`,
   );
+}
+
+/* ============================================================
+ * Fase 5: «Bli frivillig»-knapp og rollekrav for poeng
+ * ============================================================ */
+
+// Er rollekrav slått på (volunteerRoleId satt), må man ha rollen for å samle poeng
+const isVolunteer = (i, settings) =>
+  !settings.volunteerRoleId ||
+  memberRoles(i).includes(settings.volunteerRoleId);
+
+function notVolunteerReply(settings) {
+  const where = settings.volunteerChannelId
+    ? ` i <#${settings.volunteerChannelId}>`
+    : "";
+  return ephemeral(
+    `🙋 For å samle poeng må du først bli frivillig. Trykk på «Bli frivillig»-knappen${where}, så får du rollen med en gang.`,
+  );
+}
+
+function roleErrorHint(err) {
+  if (err.status === 403)
+    return "boten mangler tillatelsen *Manage Roles*, eller Frivillig-rollen ligger over botens rolle i rollelisten (Serverinnstillinger → Roller).";
+  if (err.status === 404)
+    return "rollen eller brukeren finnes ikke. Sjekk rolle-ID-en i `/innstillinger`.";
+  return `Discord svarte ${err.status ?? "med en feil"}.`;
+}
+
+async function cmdFrivilligKnapp(i, opts, userId) {
+  if (!isAdmin(i)) return ephemeral(NO_ACCESS);
+  const settings = await loadSettings();
+  if (!settings.volunteerRoleId)
+    return ephemeral(
+      "Sett først rollen: `/innstillinger innstilling:Discord-rolle: Frivillig verdi:<rolle-ID>`. Lag rollen i Serverinnstillinger → Roller hvis du ikke har den.",
+    );
+
+  const text =
+    opts.tekst ??
+    `Vil du hjelpe til og samle poeng? Trykk på knappen under for å få rollen <@&${settings.volunteerRoleId}>.\n\n` +
+      "Da kan du ta oppgaver med `/oppgaver`, delta på møter og få poeng.\n" +
+      "Du kan når som helst gå ut igjen, og poengene dine blir liggende.";
+  try {
+    await postToChannel(i.channel_id, {
+      embeds: [
+        { title: "🙋 Bli frivillig", description: text, color: 0x57f287 },
+      ],
+      components: [
+        {
+          type: 1,
+          components: [
+            button(3, "🙋 Bli frivillig", "join_vol"),
+            button(2, "Slutt som frivillig", "leave_vol"),
+          ],
+        },
+      ],
+      allowed_mentions: { parse: [] },
+    });
+  } catch (err) {
+    console.error("Kunne ikke poste frivillig-knapp", err.message);
+    return ephemeral(
+      "Jeg fikk ikke postet i denne kanalen. Gi meg tillatelsene *Se kanal*, *Send meldinger* og *Bygg inn lenker* her.",
+    );
+  }
+  // Husk kanalen, så beskjeden til de som mangler rollen kan peke hit
+  await db
+    .send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: { PK: "CONFIG", SK: "SETTINGS" },
+        UpdateExpression: "SET volunteerChannelId = :c, updatedAt = :ts",
+        ExpressionAttributeValues: { ":c": i.channel_id, ":ts": now() },
+      }),
+    )
+    .catch((e) =>
+      console.warn("Kunne ikke lagre volunteerChannelId", e.message),
+    );
+  return ephemeral(
+    "✅ Knappen er lagt ut i kanalen. Fest meldingen (høyreklikk → Fest melding) så den blir stående.",
+  );
+}
+
+async function joinVolunteer(i) {
+  const settings = await loadSettings();
+  const roleId = settings.volunteerRoleId;
+  if (!roleId)
+    return ephemeral(
+      "Frivillig-rollen er ikke satt opp ennå. Si fra til en admin 🙂",
+    );
+  const user = userOf(i);
+  if (memberRoles(i).includes(roleId))
+    return ephemeral(
+      "Du er allerede frivillig 🎉 Se hva som er ledig med `/oppgaver`.",
+    );
+
+  const guild = i.guild_id ?? process.env.GUILD_ID;
+  try {
+    await discord(`/guilds/${guild}/members/${user.id}/roles/${roleId}`, {
+      method: "PUT",
+    });
+  } catch (err) {
+    console.error("Kunne ikke gi frivillig-rolle:", err.message);
+    if (settings.adminChannelId)
+      await withTimeout(
+        postToChannel(settings.adminChannelId, {
+          content: `⚠️ Jeg kunne ikke gi Frivillig-rollen til <@${user.id}>: ${roleErrorHint(err)}`,
+          allowed_mentions: { parse: [] },
+        }),
+        1500,
+      );
+    return ephemeral(
+      "Beklager, jeg klarte ikke å gi deg rollen akkurat nå. Jeg har gitt admin beskjed 🙏",
+    );
+  }
+  return ephemeral(
+    "🙌 Velkommen som frivillig! Rollen er din. Slik kommer du i gang:\n" +
+      "• `/oppgaver` – se og ta oppgaver\n" +
+      "• `/mine-oppgaver` – dine oppgaver\n" +
+      "• `/poeng` – se poengene dine\n" +
+      "Husk å ha DM åpne fra serveren, så får du beskjeder fra meg 💙",
+  );
+}
+
+async function leaveVolunteer(i) {
+  const settings = await loadSettings();
+  const roleId = settings.volunteerRoleId;
+  if (!roleId) return ephemeral("Frivillig-rollen er ikke satt opp.");
+  const user = userOf(i);
+  if (!memberRoles(i).includes(roleId))
+    return ephemeral("Du er ikke frivillig akkurat nå 🙂");
+
+  const open = await userSignups(user.id, ["active", "waitlist", "submitted"]);
+  if (open.length)
+    return ephemeral(
+      `Du har ${open.length} oppgave${open.length === 1 ? "" : "r"} (eller ventelisteplass) som ikke er avsluttet. Slipp eller ferdigmeld dem først med \`/mine-oppgaver\`, så kan du melde deg ut.`,
+    );
+  const guild = i.guild_id ?? process.env.GUILD_ID;
+  try {
+    await discord(`/guilds/${guild}/members/${user.id}/roles/${roleId}`, {
+      method: "DELETE",
+    });
+  } catch (err) {
+    console.error("Kunne ikke fjerne frivillig-rolle:", err.message);
+    return ephemeral(
+      "Beklager, jeg klarte ikke å ta bort rollen akkurat nå. Prøv igjen, eller si fra til en admin 🙏",
+    );
+  }
+  return ephemeral(
+    "👋 Du er ikke lenger frivillig. Poengene dine ligger trygt, og du kan trykke på «Bli frivillig» igjen når som helst. Takk for innsatsen! 💙",
+  );
+}
+
+// Gir rollen til alle som allerede har en poengprofil, så ingen faller utenfor når rollekravet slås på
+async function cmdFrivilligSynk(i, opts, userId) {
+  if (!isAdmin(i)) return ephemeral(NO_ACCESS);
+  const settings = await loadSettings();
+  if (!settings.volunteerRoleId)
+    return ephemeral(
+      "Sett først rollen med `/innstillinger` (Discord-rolle: Frivillig).",
+    );
+  const started = await dispatchAsync({
+    job: "grantRole",
+    requesterId: userId,
+    guildId: i.guild_id ?? process.env.GUILD_ID,
+    roleId: settings.volunteerRoleId,
+    adminChannelId: settings.adminChannelId,
+  });
+  if (!started)
+    return ephemeral(
+      "Jeg klarte ikke å starte jobben. Sjekk at Lambdaen har tillatelsen `lambda:InvokeFunction` (se SETUP.md).",
+    );
+  return ephemeral(
+    "⏳ Gir rollen til alle som allerede har poeng. Du får en DM med resultatet når jeg er ferdig.",
+  );
+}
+
+async function runGrantRole(p) {
+  try {
+    const profiles = await scanAll({
+      FilterExpression: "SK = :s",
+      ExpressionAttributeValues: { ":s": "PROFILE" },
+    });
+    const ids = profiles.map((x) => x.PK.replace("USER#", ""));
+    let given = 0;
+    let left = 0;
+    let failed = 0;
+    let firstError;
+    for (const part of chunk(ids, 5)) {
+      await Promise.all(
+        part.map(async (id) => {
+          try {
+            await discord(
+              `/guilds/${p.guildId}/members/${id}/roles/${p.roleId}`,
+              { method: "PUT" },
+            );
+            given++;
+          } catch (err) {
+            if (err.status === 404) left++;
+            else {
+              failed++;
+              firstError ??= err;
+            }
+          }
+        }),
+      );
+    }
+    const parts = [
+      `✅ Frivillig-rollen er gitt til **${given}** av ${ids.length} med poengprofil.`,
+    ];
+    if (left) parts.push(`${left} er ikke lenger på serveren.`);
+    if (failed) parts.push(`⚠️ ${failed} feilet: ${roleErrorHint(firstError)}`);
+    await deliverToRequester(p, parts.join("\n"));
+    return { given, left, failed };
+  } catch (err) {
+    console.error("grantRole feilet:", err);
+    await deliverToRequester(
+      p,
+      `⚠️ Jobben feilet: ${String(err.message).slice(0, 200)}`,
+    ).catch(() => {});
+    return { error: String(err.message) };
+  }
 }
 
 /* ============================================================
