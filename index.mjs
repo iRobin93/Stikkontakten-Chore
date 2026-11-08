@@ -330,7 +330,7 @@ async function queryAll(params) {
     const r = await db.send(
       new QueryCommand({ TableName: TABLE, ...params, ExclusiveStartKey }),
     );
-    items.push(...(r.Items ?? []));
+    for (const item of r.Items ?? []) items.push(item);
     ExclusiveStartKey = r.LastEvaluatedKey;
   } while (ExclusiveStartKey);
   return items;
@@ -3683,6 +3683,7 @@ async function runTaskEdited(p) {
  * ============================================================ */
 
 const EXPORT_LABELS = {
+  alt: "Alt",
   frivillige: "Frivillige",
   oppgaver: "Oppgaver",
   poenglogg: "Poenglogg",
@@ -3714,7 +3715,7 @@ async function scanAll(params) {
     const r = await db.send(
       new ScanCommand({ TableName: TABLE, ...params, ExclusiveStartKey }),
     );
-    items.push(...(r.Items ?? []));
+    for (const item of r.Items ?? []) items.push(item);
     ExclusiveStartKey = r.LastEvaluatedKey;
   } while (ExclusiveStartKey);
   return items;
@@ -3871,44 +3872,55 @@ async function buildExport(type, { fraIso, toIso }) {
   };
 }
 
-async function lookupNames(userIds) {
+async function lookupNames(userIds, cache = new Map()) {
   const guild = process.env.GUILD_ID;
-  const out = new Map();
-  if (!guild) return out;
-  const ids = [...new Set(userIds)].slice(0, 500);
-  for (const part of chunk(ids, 5)) {
+  if (!guild) return cache;
+  const missing = [...new Set(userIds)]
+    .filter((id) => !cache.has(id))
+    .slice(0, 500);
+  for (const part of chunk(missing, 5)) {
     await Promise.all(
       part.map(async (id) => {
         try {
           const m = await discord(`/guilds/${guild}/members/${id}`);
-          out.set(id, m.nick ?? m.user?.global_name ?? m.user?.username ?? "");
+          cache.set(
+            id,
+            m.nick ?? m.user?.global_name ?? m.user?.username ?? "",
+          );
         } catch (err) {
-          out.set(id, err.status === 404 ? "(forlatt serveren)" : "");
+          cache.set(id, err.status === 404 ? "(forlatt serveren)" : "");
         }
       }),
     );
   }
-  return out;
+  return cache;
 }
 
-// Sender til brukeren på DM. Er DM stengt, havner filen i admin-kanalen.
-async function deliverToRequester(p, content, csv, filename) {
+const EXPORT_MAX_BYTES = 9.5 * 1024 * 1024; // Discord tar imot ca. 10 MB per melding uten serverboost
+const EXPORT_ALL = ["frivillige", "oppgaver", "poenglogg", "moter"];
+
+// Sender én melding med null eller flere CSV-filer på DM.
+// Er DM stengt, havner den i admin-kanalen.
+async function deliverToRequester(p, content, files = []) {
   const makeForm = (text) => {
     const form = new FormData();
     form.append(
       "payload_json",
       JSON.stringify({
         content: text,
-        ...(csv ? { attachments: [{ id: 0, filename }] } : {}),
+        ...(files.length
+          ? { attachments: files.map((f, n) => ({ id: n, filename: f.name })) }
+          : {}),
         allowed_mentions: { users: [p.requesterId] },
       }),
     );
-    if (csv)
+    files.forEach((f, n) =>
       form.append(
-        "files[0]",
-        new Blob([csv], { type: "text/csv; charset=utf-8" }),
-        filename,
-      );
+        `files[${n}]`,
+        new Blob([f.csv], { type: "text/csv; charset=utf-8" }),
+        f.name,
+      ),
+    );
     return form;
   };
   try {
@@ -3942,54 +3954,73 @@ async function runExport(p) {
     const toIso = p.til
       ? osloLocalToIso(addDays(p.til, 1), "00:00")
       : undefined; // «til» er inklusiv
-    const { header, rows, userCol } = await buildExport(p.type, {
-      fraIso,
-      toIso,
-    });
+    const types = p.type === "alt" ? EXPORT_ALL : [p.type];
+    const nameCache = new Map();
+    const files = [];
+    const lines = [];
 
-    if (!rows.length) {
-      await deliverToRequester(
-        p,
-        `📤 **${EXPORT_LABELS[p.type]}**: ingen rader å eksportere for valgt periode.`,
-      );
-      return { rows: 0 };
-    }
-
-    let head = header;
-    let body = rows;
-    if (p.names && userCol !== null) {
-      const names = await lookupNames(rows.map((r) => r[userCol]));
-      head = [
-        ...header.slice(0, userCol + 1),
-        "brukernavn",
-        ...header.slice(userCol + 1),
-      ];
-      body = rows.map((r) => [
-        ...r.slice(0, userCol + 1),
-        names.get(r[userCol]) ?? "",
-        ...r.slice(userCol + 1),
-      ]);
-    }
-
-    const csv = toCsv(head, body);
-    if (Buffer.byteLength(csv) > 9.5 * 1024 * 1024) {
-      await deliverToRequester(
-        p,
-        `⚠️ **${EXPORT_LABELS[p.type]}**: filen ble for stor for Discord (over ca. 10 MB). Avgrens perioden med \`fra\` og \`til\`.`,
-      );
-      return { rows: rows.length, tooBig: true };
+    for (const type of types) {
+      const { header, rows, userCol } = await buildExport(type, {
+        fraIso,
+        toIso,
+      });
+      const label = EXPORT_LABELS[type];
+      if (!rows.length) {
+        lines.push(`• ${label}: ingen rader`);
+        continue;
+      }
+      let head = header;
+      let body = rows;
+      if (p.names && userCol !== null) {
+        await lookupNames(
+          rows.map((r) => r[userCol]),
+          nameCache,
+        );
+        head = [
+          ...header.slice(0, userCol + 1),
+          "brukernavn",
+          ...header.slice(userCol + 1),
+        ];
+        body = rows.map((r) => [
+          ...r.slice(0, userCol + 1),
+          nameCache.get(r[userCol]) ?? "",
+          ...r.slice(userCol + 1),
+        ]);
+      }
+      const csv = toCsv(head, body);
+      if (Buffer.byteLength(csv) > EXPORT_MAX_BYTES) {
+        lines.push(
+          `• ${label}: ${rows.length} rader, men filen er for stor for Discord. Avgrens perioden med \`fra\` og \`til\``,
+        );
+        continue;
+      }
+      files.push({ name: `eksport-${type}-${todayOslo()}.csv`, csv });
+      lines.push(`• ${label}: ${rows.length} rader`);
     }
 
     const period =
       p.fra || p.til ? ` (${p.fra ?? "start"} til ${p.til ?? "nå"})` : "";
-    const filename = `eksport-${p.type}-${todayOslo()}.csv`;
-    const where = await deliverToRequester(
-      p,
-      `📤 **Eksport: ${EXPORT_LABELS[p.type]}**${period} · ${rows.length} rader\nSemikolon-separert UTF-8, åpnes direkte i Excel. Inneholder personopplysninger, så ikke del den videre.`,
-      csv,
-      filename,
-    );
-    return { rows: rows.length, where };
+    const content =
+      `📤 **Eksport: ${EXPORT_LABELS[p.type]}**${period}\n${lines.join("\n")}` +
+      (files.length
+        ? "\nSemikolon-separert UTF-8, åpnes direkte i Excel. Inneholder personopplysninger, så ikke del dem videre."
+        : "");
+
+    // Alle filene i én melding hvis de får plass, ellers én melding per fil
+    const total = files.reduce((n, f) => n + Buffer.byteLength(f.csv), 0);
+    const groups =
+      files.length && total > EXPORT_MAX_BYTES
+        ? files.map((f) => [f])
+        : [files];
+    let where;
+    for (const [n, group] of groups.entries()) {
+      where = await deliverToRequester(
+        p,
+        n === 0 ? content : `📎 ${group.map((f) => f.name).join(", ")}`,
+        group,
+      );
+    }
+    return { files: files.length, where };
   } catch (err) {
     console.error("Eksport feilet:", err);
     const hint = /AccessDenied|not authorized/i.test(String(err.message))
@@ -4033,11 +4064,12 @@ async function cmdEksport(i, opts, userId) {
       "Jeg klarte ikke å starte eksporten. Sjekk at Lambdaen har tillatelsen `lambda:InvokeFunction` (se SETUP.md).",
     );
   const note =
-    opts.type === "frivillige" && (opts.fra || opts.til)
+    (opts.type === "frivillige" || opts.type === "alt") &&
+    (opts.fra || opts.til)
       ? "\n_Merk: perioden brukes ikke for «Frivillige»._"
       : "";
   return ephemeral(
-    `📤 Eksporten **${EXPORT_LABELS[opts.type]}** lages nå. Filen kommer på DM til deg om litt (eller i admin-kanalen hvis DM er stengt).${note}`,
+    `📤 Eksporten **${EXPORT_LABELS[opts.type]}** lages nå. ${opts.type === "alt" ? "Filene kommer" : "Filen kommer"} på DM til deg om litt (eller i admin-kanalen hvis DM er stengt).${note}`,
   );
 }
 

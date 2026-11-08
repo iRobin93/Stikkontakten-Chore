@@ -181,7 +181,7 @@ Opprett fire schedules i EventBridge Scheduler, alle med Lambdaen som target og 
 
 **`/eksport`** (bare admin)
 
-- Velg `type`: Frivillige, Oppgaver, Poenglogg eller Møter. `fra` og `til` (`ÅÅÅÅ-MM-DD`, inklusive, norsk tid) avgrenser oppgaver, poenglogg og møter. De brukes ikke for Frivillige.
+- Velg `type`: **Alt**, Frivillige, Oppgaver, Poenglogg eller Møter. «Alt» lager de fire filene i én kjøring og sender dem samlet i én melding. Får de ikke plass i én melding (over ca. 10 MB til sammen), kommer de som flere meldinger. Typer uten data hoppes over, og meldingen forteller hva som er med. `fra` og `til` (`ÅÅÅÅ-MM-DD`, inklusive, norsk tid) avgrenser oppgaver, poenglogg og møter. De brukes ikke for Frivillige.
 - Filen lages i en bakgrunnsjobb og sendes som vedlegg på **DM** til den som kjørte kommandoen. Er DM stengt, havner den i admin-kanalen.
 - Filen har Discord-ID-er. Sett `brukernavn:ja` for å få en kolonne med servernavn (de som har forlatt serveren, markeres).
 - Formatet er **semikolon, komma som desimaltegn og UTF-8 med BOM**, så den åpnes rett i norsk Excel. I Google Sheets: Fil → Importer → velg semikolon som skilletegn. Tekst som starter med `=`, `+`, `-` eller `@` får en apostrof foran, så regneark ikke tolker den som formel.

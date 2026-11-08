@@ -370,6 +370,7 @@ const commands = [
         description: "Hva skal eksporteres?",
         required: true,
         choices: [
+          { name: "Alt (alle fire som separate filer)", value: "alt" },
           { name: "Frivillige (poeng, nivå, streak)", value: "frivillige" },
           { name: "Oppgaver", value: "oppgaver" },
           { name: "Poenglogg", value: "poenglogg" },
