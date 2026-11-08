@@ -473,7 +473,8 @@ const commands = [
       {
         type: INTEGER,
         name: "dagerfor",
-        description: "Legg ut møtet så mange dager før (standard 3)",
+        description:
+          "Legg ut møtet så mange dager før (standard: innstilling, 0)",
         min_value: 0,
         max_value: 14,
       },

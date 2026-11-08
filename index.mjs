@@ -70,6 +70,7 @@ const DEFAULT_SETTINGS = {
   photoChannelId: process.env.PHOTO_CHANNEL_ID ?? null,
   volunteerRoleId: process.env.VOLUNTEER_ROLE_ID ?? null, // satt = man må ha rollen for å samle poeng
   volunteerChannelId: null, // settes automatisk av /frivillig-knapp
+  meetingLeadDays: 0, // standard for møtemaler: antall dager før møtet det legges ut (0 = samme dag)
   photoMaxMb: 9.5, // største bilde boten laster opp på nytt (Discord: ca. 10 uten serverboost)
   shoutoutChannelId: process.env.SHOUTOUT_CHANNEL_ID ?? null,
 };
@@ -187,6 +188,12 @@ const SETTING_DEFS = {
   volunteerChannelId: {
     type: "id",
     label: "Kanal med «Bli frivillig»-knappen (settes automatisk)",
+  },
+  meetingLeadDays: {
+    type: "int",
+    min: 0,
+    max: 14,
+    label: "Møtemaler: dager før møtet de legges ut (0 = samme dag)",
   },
   photoMaxMb: {
     type: "float",
@@ -4868,7 +4875,7 @@ async function cmdMoteMalNy(i, opts, userId) {
     anchorDay: dag,
     startDate,
     slots: opts.plasser ?? null, // null = ubegrenset
-    leadDays: opts.dagerfor ?? 3,
+    leadDays: opts.dagerfor ?? (await loadSettings()).meetingLeadDays,
     channelId: opts.kanal ?? i.channel_id,
     createdBy: userId,
     createdAt: now(),
@@ -4893,7 +4900,7 @@ async function cmdMoteMalNy(i, opts, userId) {
     );
   const next = upcomingOccurrence(tpl);
   return ephemeral(
-    `${head}\nNeste møte er ${fmtDate(next)}, og det legges ut automatisk ${tpl.leadDays} dager før.`,
+    `${head}\nNeste møte er ${fmtDate(next)}, og det legges ut automatisk ${tpl.leadDays === 0 ? "samme dag" : `${tpl.leadDays} dager før`}.`,
   );
 }
 
@@ -4904,7 +4911,7 @@ async function cmdMoteMalListe(i) {
     return ephemeral("Ingen møtemaler ennå. Lag en med `/møtemal-ny`.");
   const lines = templates.map(
     (t) =>
-      `• **${t.title}** · ${describeMeetingSchedule(t)} · <#${t.channelId}> · ${t.slots == null ? "ubegrenset" : `${t.slots} plasser`} · legges ut ${t.leadDays} dager før · neste: ${fmtDate(upcomingOccurrence(t))}`,
+      `• **${t.title}** · ${describeMeetingSchedule(t)} · <#${t.channelId}> · ${t.slots == null ? "ubegrenset" : `${t.slots} plasser`} · legges ut ${t.leadDays === 0 ? "samme dag" : `${t.leadDays} dager før`} · neste: ${fmtDate(upcomingOccurrence(t))}`,
   );
   return ephemeral(`**Møtemaler**\n${lines.join("\n")}`.slice(0, 1990));
 }

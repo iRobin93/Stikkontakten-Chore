@@ -226,7 +226,7 @@ Boten kan ikke lese emoji-reaksjoner (det krever en permanent tilkobling til Dis
 
 Gjentakende møter som legges ut automatisk, som oppgavemaler.
 
-- `/møtemal-ny tittel klokkeslett intervall dag` – intervall: hver uke, annenhver uke eller hver måned. `dag` er ukedag 1–7 (1 = mandag) for uke-maler, og dag i måneden 1–28 for månedlige. Valgfritt: `plasser` (standard: ubegrenset), `kanal` (standard: kanalen du skriver i) og `dagerfor` (legg ut så mange dager før, standard 3).
+- `/møtemal-ny tittel klokkeslett intervall dag` – intervall: hver uke, annenhver uke eller hver måned. `dag` er ukedag 1–7 (1 = mandag) for uke-maler, og dag i måneden 1–28 for månedlige. Valgfritt: `plasser` (standard: ubegrenset), `kanal` (standard: kanalen du skriver i) og `dagerfor` (legg ut så mange dager før, standard fra innstillingen «Møtemaler: dager før møtet de legges ut», som er 0 = samme dag).
 - `/møtemal-liste` viser malene og neste dato. `/møtemal-slett` (admin) fjerner en mal. Møter som allerede er lagt ut, blir liggende.
 - **Nattjobben** (`nightly`) legger ut neste møte når det er innenfor «dager før». Det legges ut bare én gang per møtedato. Møtemeldingen er den vanlige med _Meld meg på_, _Meld meg av_ og _Jeg er her_.
 - Lager du en mal og neste møte allerede er innenfor tidsrommet, legges det ut med en gang.
