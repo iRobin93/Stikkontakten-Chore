@@ -75,11 +75,11 @@ Uten denne tillatelsen virker godkjenning og poeng som vanlig, men bildet blir i
 | `TABLE_NAME`          | `frivillig`                                                                           |
 | `DISCORD_PUBLIC_KEY`  | Public key fra Developer Portal                                                       |
 | `DISCORD_TOKEN`       | Bot-token                                                                             |
-| `ADMIN_ROLE_ID`       | ID til admin-rollen                                                                   |
-| `LEADER_ROLE_ID`      | ID til rollen «Voksen leder»                                                          |
+| `ADMIN_ROLE_ID`       | (valgfri) ID til admin-rollen. `/oppsett` lager og lagrer den hvis den mangler        |
+| `LEADER_ROLE_ID`      | (valgfri) ID til rollen «Voksen leder». `/oppsett` lager og lagrer den hvis den mangler |
 | `ADMIN_CHANNEL_ID`    | (valgfri) kanal for godkjenninger – kan i stedet settes med `/innstillinger`          |
 | `FALLBACK_CHANNEL_ID` | (valgfri) reservekanal hvis DM er stengt                                              |
-| `GUILD_ID`            | Server-ID. **Påkrevd for nivå-roller** (boten gir og fjerner roller i denne serveren) |
+| `GUILD_ID`            | (valgfri) Server-ID for nivå-roller og kallenavn. `/oppsett` lagrer den automatisk     |
 | `VOLUNTEER_ROLE_ID`   | (valgfri) ID til Frivillig-rollen, kan i stedet settes med `/innstillinger`           |
 | `PHOTO_CHANNEL_ID`    | (valgfri) bildekanalen, kan i stedet settes med `/innstillinger`                      |
 | `SHOUTOUT_CHANNEL_ID` | (valgfri) kanal for månedens frivillige, kan settes med `/innstillinger`              |
@@ -244,3 +244,64 @@ Gjentakende møter som legges ut automatisk, som oppgavemaler.
 **Møteplasser:** møter har ubegrenset antall plasser som standard, så alle med Frivillig-rollen kan melde seg på. Sett `plasser` på `/møte` eller `/møtemal-ny` hvis du vil ha et tak. Eksisterende møter beholder sin grense.
 
 **Deltakerliste på møter:** møtemeldingen viser hvem som er påmeldt (🙋) og hvem som har sjekket inn (✅), som Discord-navn uten at noen pinges. Listen oppdateres når noen melder seg på, av eller sjekker inn. Er den lang, vises de første og resten som «…og N til».
+
+## Fase 7: tillitsbaserte oppgaver og obligatoriske møter
+
+**Tillitsbasert eller godkjenning** (`/innstillinger innstilling:Oppgaver: tillitsbasert`)
+
+- `0` (standard): som før. `/ferdig` sendes til admin-kanalen med ✅ Godkjenn / ❌ Avslå.
+- `1`: tillitsbasert. `/ferdig` gir poengene med en gang (med multiplikator som vanlig), og oppgaven regnes som fullført. Admin-kanalen får en logglinje uten knapper (med bildet hvis det er lagt ved). Feil rettes med `/poeng-juster`.
+- I tillitsbasert modus publiseres bilder **ikke** automatisk i bildekanalen, siden ingen voksen har sett dem først (personvern). Bildet vises i loggmeldingen i admin-kanalen.
+- Admin-kanal er ikke påkrevd i tillitsbasert modus, men anbefales så dere ser hva som skjer.
+- Ferdigmeldinger som allerede venter på godkjenning når du bytter, ligger igjen med knappene sine.
+- Gjelder alle oppgaver. I loggen står `gitt_av` som `tillit` for poeng gitt på denne måten.
+
+**Obligatoriske møter** (`påkrevd`)
+
+- `/møtemal-ny … påkrevd:True` lager en mal der alle møtene er obligatoriske. `/møte … påkrevd:True` gjør det samme for et enkeltmøte.
+- `/møtemal-rediger mal:<mal> påkrevd:True/False` slår det av eller på for en eksisterende mal. Gjelder møter som legges ut etter endringen.
+- Møtemeldingen merkes «obligatorisk» og har knappene _Jeg kommer_, _Kan ikke komme_ og _Jeg er her_.
+- **Kan ikke komme** åpner et skjema der grunn er påkrevd (3–300 tegn). Grunnen postes i admin-kanalen og lagres, men vises aldri i den offentlige møtemeldingen. Der står bare antallet som har meldt forfall.
+- Var personen påmeldt, meldes hen av samtidig. Ombestemmer hen seg og trykker _Jeg kommer_, fjernes forfallet og admin-kanalen får beskjed.
+- Trykker man _Kan ikke komme_ igjen, kan grunnen endres (den gamle står ferdig utfylt).
+- På obligatoriske møter kan man sjekke inn uten å ha meldt seg på først.
+- `/eksport` (møter) har nye kolonner: `obligatorisk` og `meldt_forfall`.
+- Ingen nye indekser, miljøvariabler eller IAM-rettigheter. Kjør _register-commands_ på nytt (skjer automatisk ved push) for de nye valgene.
+
+## Fase 8: `/oppsett` lager roller og kanaler
+
+Kjør `/oppsett` (admin) én gang etter at boten er invitert. Den lager det som mangler og lagrer alle ID-ene i innstillingene, så du slipper å lime inn ID-er selv.
+
+**Før du kjører den**
+
+- Botten trenger tillatelsene **Manage Roles** og **Manage Channels** (i tillegg til de vanlige). Enklest er å gi botens rolle disse i Serverinnstillinger → Roller.
+- Lambdaen trenger `lambda:InvokeFunction` (se IAM), siden oppsettet kjører i bakgrunnen. Svaret kommer i samme melding når det er ferdig (vanligvis noen sekunder).
+
+**Roller** (lages uten Discord-tillatelser, de betyr bare noe for boten)
+
+| Rolle | Innstilling | Brukes til |
+| --- | --- | --- |
+| Frivillig-admin | `adminRoleId` | Admin i boten (Discord-administratorer er admin uansett) |
+| Voksen leder | `leaderRoleId` | Leder i boten |
+| Frivillig | `volunteerRoleId` | Kreves for å samle poeng (se fase 5) |
+| Rekrutt, Veteran, Legende | `roleRecruitId` osv. | Nivåroller |
+
+**Kanaler** (i kategorien «Frivillig»)
+
+| Kanal | Hvem ser den | Brukes til |
+| --- | --- | --- |
+| `#frivillig-admin` | Bare admin og ledere | Godkjenninger, forslag, ideer, gjester, forfall |
+| `#frivillig` | Frivillige og ledere | Oppgaver og møter, beskjeder til dem med stengt DM, ukesoppsummering |
+| `#bli-frivillig` | Alle (bare lesing) | «Bli frivillig»-knappen (legges ut automatisk) |
+| `#før-og-etter` | Alle (bare lesing) | Bildekanal |
+| `#månedens-frivillige` | Alle (bare lesing) | Månedens frivillige |
+
+**Slik oppfører den seg**
+
+- Finnes det allerede en rolle eller kanal som er satt i `/innstillinger`, eller en med samme navn, brukes den. Bare det som mangler, lages.
+- Ingenting slettes, og tillatelser på eksisterende kanaler og roller endres ikke. Du kan trygt kjøre den igjen.
+- Første gang Frivillig-rollen settes, får alle som allerede har poeng rollen automatisk (som `/frivillig-synk`), så ingen faller utenfor.
+- «Bli frivillig»-knappen legges bare ut når kanalen lages. `/oppsett knapp:True` legger den ut på nytt.
+- Ligger en eksisterende Frivillig- eller nivårolle over botens rolle, får du beskjed om å flytte botens rolle opp.
+- Admin- og lederrollen ligger nå i innstillingene. `ADMIN_ROLE_ID` og `LEADER_ROLE_ID` brukes bare hvis de ikke er satt der.
+- Etterpå: gi deg selv og de andre voksne rollene Frivillig-admin eller Voksen leder, og fest knappmeldingen.

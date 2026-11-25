@@ -39,6 +39,7 @@ const SIZE_SETTING = {
 const DEFAULT_SETTINGS = {
   checkinDays: 2,
   maxActiveTasks: 3, // 0 = ingen grense
+  taskTrustMode: 0, // 1 = tillitsbasert: /ferdig gir poeng med en gang. 0 = admin/leder må godkjenne
   pointsSmall: 10,
   pointsMedium: 25,
   pointsLarge: 50,
@@ -73,6 +74,12 @@ const DEFAULT_SETTINGS = {
   meetingLeadDays: 0, // standard for møtemaler: antall dager før møtet det legges ut (0 = samme dag)
   photoMaxMb: 9.5, // største bilde boten laster opp på nytt (Discord: ca. 10 uten serverboost)
   shoutoutChannelId: process.env.SHOUTOUT_CHANNEL_ID ?? null,
+  // Satt av /oppsett (kan også endres for hånd). Miljøvariablene brukes hvis de ikke er satt her.
+  adminRoleId: process.env.ADMIN_ROLE_ID ?? null,
+  leaderRoleId: process.env.LEADER_ROLE_ID ?? null,
+  hubChannelId: null,
+  categoryId: null,
+  guildId: null,
 };
 
 const SETTING_DEFS = {
@@ -82,6 +89,13 @@ const SETTING_DEFS = {
     min: 0,
     max: 50,
     label: "Maks aktive oppgaver per person (0 = ingen grense)",
+  },
+  taskTrustMode: {
+    type: "int",
+    min: 0,
+    max: 1,
+    label:
+      "Oppgaver: tillitsbasert (1 = poeng med en gang ved /ferdig, 0 = må godkjennes)",
   },
   pointsSmall: { type: "int", min: 0, max: 10000, label: "Poeng: lite" },
   pointsMedium: { type: "int", min: 0, max: 10000, label: "Poeng: middels" },
@@ -202,7 +216,27 @@ const SETTING_DEFS = {
     label: "Bilde: maks størrelse i MB (ca. 10 uten serverboost)",
   },
   shoutoutChannelId: { type: "id", label: "Kanal for månedens frivillige" },
+  adminRoleId: { type: "id", kind: "role", label: "Discord-rolle: Admin" },
+  leaderRoleId: {
+    type: "id",
+    kind: "role",
+    label: "Discord-rolle: Voksen leder",
+  },
+  hubChannelId: {
+    type: "id",
+    label: "Kanal for frivillige (oppgaver og møter)",
+  },
+  categoryId: { type: "id", label: "Kategori for frivillig-kanalene" },
+  guildId: { type: "id", kind: "plain", label: "Server-ID (settes av /oppsett)" },
 };
+// Rolle-innstillinger vises som @rolle i /innstillinger
+for (const k of [
+  "roleRecruitId",
+  "roleVeteranId",
+  "roleLegendId",
+  "volunteerRoleId",
+])
+  SETTING_DEFS[k].kind = "role";
 
 const NO_ACCESS = "Dette er forbeholdt admin/leder 🙂";
 const MAX_LIST = 15; // maks oppgaver/knapper i én melding (Discord tillater 25 knapper)
@@ -253,18 +287,18 @@ const actionRows = (buttons) =>
  * ============================================================ */
 
 const memberRoles = (i) => i.member?.roles ?? [];
+// Rolle-IDene leses fra innstillingene (lastes i handleren før hver forespørsel), ellers miljøvariablene
+let cachedSettings = null;
+const adminRoleId = () =>
+  cachedSettings?.adminRoleId ?? process.env.ADMIN_ROLE_ID;
+const leaderRoleId = () =>
+  cachedSettings?.leaderRoleId ?? process.env.LEADER_ROLE_ID;
 // Admin = admin-rollen ELLER Discord-tillatelsen «Administrator» (praktisk under oppsett)
 const isAdmin = (i) =>
   (BigInt(i.member?.permissions ?? 0) & 0x8n) !== 0n ||
-  Boolean(
-    process.env.ADMIN_ROLE_ID &&
-    memberRoles(i).includes(process.env.ADMIN_ROLE_ID),
-  );
+  Boolean(adminRoleId() && memberRoles(i).includes(adminRoleId()));
 const isLeader = (i) =>
-  Boolean(
-    process.env.LEADER_ROLE_ID &&
-    memberRoles(i).includes(process.env.LEADER_ROLE_ID),
-  );
+  Boolean(leaderRoleId() && memberRoles(i).includes(leaderRoleId()));
 const canManage = (i) => isAdmin(i) || isLeader(i);
 
 /* ============================================================
@@ -371,8 +405,35 @@ async function getTasks(ids) {
 async function loadSettings() {
   const item = await getItem({ PK: "CONFIG", SK: "SETTINGS" });
   const { PK, SK, updatedAt, ...stored } = item ?? {};
-  return { ...DEFAULT_SETTINGS, ...stored };
+  cachedSettings = { ...DEFAULT_SETTINGS, ...stored };
+  return cachedSettings;
 }
+
+// Lagrer flere innstillinger i én operasjon
+async function saveSettings(values) {
+  const entries = Object.entries(values);
+  if (!entries.length) return;
+  const names = {};
+  const vals = { ":ts": now() };
+  const sets = entries.map(([k, v], n) => {
+    names[`#k${n}`] = k;
+    vals[`:v${n}`] = v;
+    return `#k${n} = :v${n}`;
+  });
+  await db.send(
+    new UpdateCommand({
+      TableName: TABLE,
+      Key: { PK: "CONFIG", SK: "SETTINGS" },
+      UpdateExpression: `SET ${sets.join(", ")}, updatedAt = :ts`,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: vals,
+    }),
+  );
+}
+
+// Server-ID: miljøvariabelen GUILD_ID, ellers den /oppsett lagret
+const guildIdOf = (settings) =>
+  process.env.GUILD_ID || settings?.guildId || null;
 
 // Alle påmeldinger for en bruker (via GSI2), nyeste først
 function userSignups(userId, statuses) {
@@ -896,7 +957,8 @@ async function cmdFerdig(i, opts, userId) {
 
   const [task, settings] = await Promise.all([getTask(taskId), loadSettings()]);
   if (!task) return ephemeral("Fant ikke oppgaven.");
-  if (!settings.adminChannelId)
+  const trust = settings.taskTrustMode === 1;
+  if (!trust && !settings.adminChannelId)
     return ephemeral(
       "Admin-kanalen er ikke satt opp ennå. Be en admin bruke `/innstillinger`.",
     );
@@ -930,6 +992,8 @@ async function cmdFerdig(i, opts, userId) {
     },
   ]);
   if (!r.ok) return ephemeral("Noe skjedde samtidig. Prøv igjen om litt 🙂");
+
+  if (trust) return finishTrusted(task, userId, settings, photoUrl);
 
   try {
     const msg = await postToChannel(settings.adminChannelId, {
@@ -997,6 +1061,37 @@ async function cmdFerdig(i, opts, userId) {
     : "";
   return ephemeral(
     `📤 Takk! **${task.title}** er ferdigmeldt. En admin eller leder ser på den snart.${photoNote}`,
+  );
+}
+
+// Tillitsbasert modus: ferdigmeldingen godkjennes med en gang, og admin-kanalen får bare en logglinje.
+// Bildet publiseres ikke automatisk i bildekanalen, siden ingen voksen har sett det (personvern).
+async function finishTrusted(task, userId, settings, photoUrl) {
+  const r = await approveCompletion(task.id, userId, "tillit");
+  if (!r.ok) return ephemeral("Noe skjedde samtidig. Prøv igjen om litt 🙂");
+
+  await afterApproval(r, userId, { dm: false, photo: false });
+
+  if (settings.adminChannelId) {
+    await withTimeout(
+      postToChannel(settings.adminChannelId, {
+        content:
+          `🤝 <@${userId}> fullførte **${task.title}** og fikk ${r.award.delta} poeng${awardNote(r.award)} (tillitsbasert, ingen godkjenning).\n` +
+          `_Noe som ikke stemmer? Rett det med \`/poeng-juster\`._`,
+        allowed_mentions: { parse: [] },
+        embeds: photoUrl
+          ? [{ title: task.title, color: 0x57f287, image: { url: photoUrl } }]
+          : [],
+      }).catch((e) => console.warn("Kunne ikke logge i admin-kanalen", e.message)),
+      1200,
+    );
+  }
+
+  const photoNote = photoUrl
+    ? "\n_Husk: bilder skal vise oppgaven, ikke personer._"
+    : "";
+  return ephemeral(
+    `🎉 Takk! **${task.title}** er registrert som ferdig, og du fikk ${r.award.delta} poeng${awardNote(r.award)}. Godt jobba!${photoNote}`,
   );
 }
 
@@ -1216,6 +1311,8 @@ async function runJob(job, event = {}) {
       return runExport(event);
     case "grantRole":
       return runGrantRole(event);
+    case "setup":
+      return runSetup(event);
     default:
       console.log("Ukjent eller ikke-implementert jobb:", job);
       return { skipped: job };
@@ -1419,8 +1516,13 @@ async function cmdLogg(i, opts) {
 async function cmdInnstillinger(i, opts) {
   if (!isAdmin(i)) return ephemeral(NO_ACCESS);
   const settings = await loadSettings();
-  const show = (key, v) =>
-    SETTING_DEFS[key].type === "id" && v ? `<#${v}>` : (v ?? "_ikke satt_");
+  const show = (key, v) => {
+    const def = SETTING_DEFS[key];
+    if (def.type !== "id" || !v) return v ?? "_ikke satt_";
+    if (def.kind === "role") return `<@&${v}>`;
+    if (def.kind === "plain") return v;
+    return `<#${v}>`;
+  };
 
   if (!opts.innstilling) {
     const lines = Object.entries(SETTING_DEFS).map(
@@ -1516,6 +1618,8 @@ const COMMANDS = {
   "møtemal-ny": cmdMoteMalNy,
   "møtemal-liste": cmdMoteMalListe,
   "møtemal-slett": cmdMoteMalSlett,
+  "møtemal-rediger": cmdMoteMalRediger,
+  oppsett: cmdOppsett,
   "frivillig-synk": cmdFrivilligSynk,
   takk: cmdTakk,
   ide: cmdIde,
@@ -1563,7 +1667,10 @@ async function handleAutocomplete(i) {
   if (i.data.name === "mal-slett" && isAdmin(i)) {
     tasks = await listTemplates();
   }
-  if (i.data.name === "møtemal-slett" && isAdmin(i)) {
+  if (
+    (i.data.name === "møtemal-slett" && isAdmin(i)) ||
+    (i.data.name === "møtemal-rediger" && canManage(i))
+  ) {
     tasks = await listMeetingTemplates();
   }
   if (i.data.name === "innstillinger") {
@@ -1707,6 +1814,12 @@ async function handleComponent(i) {
       });
     }
 
+    case "mt_absent": {
+      const gate = await loadSettings();
+      if (!isVolunteer(i, gate)) return notVolunteerReply(gate);
+      return meetingAbsentModal(taskId, user.id); // taskId = møte-ID her
+    }
+
     case "mt_join":
     case "mt_leave":
     case "mt_here": {
@@ -1769,6 +1882,19 @@ async function handleModal(i) {
   if (action === "idea_use_modal") return ideaUse(i, taskId);
   if (action === "sg_ok_modal") return suggestionApprove(i, taskId);
   if (action === "sg_no_modal") return suggestionReject(i, taskId);
+  if (action === "mt_absent_modal") {
+    const meetingId = taskId;
+    const reason = i.data.components?.[0]?.components?.[0]?.value?.trim() ?? "";
+    const notice = await meetingAbsent(meetingId, userOf(i).id, reason);
+    const m = await getItem(meetingKey(meetingId));
+    if (m && i.message) {
+      await discord(
+        `/channels/${i.message.channel_id ?? i.channel_id}/messages/${i.message.id}`,
+        { method: "PATCH", body: await renderMeetingFull(m) },
+      ).catch((e) => console.warn("Kunne ikke oppdatere møtemelding", e.message));
+    }
+    return ephemeral(notice);
+  }
   if (action !== "reject_modal") return ephemeral("Ukjent skjema.");
   const user = userOf(i);
   if (!canManage(i)) return ephemeral(NO_ACCESS);
@@ -2288,50 +2414,71 @@ function attendeeLines(attendees) {
   return `\n\n**Deltakere**\n${shown.join("\n")}${rest ? `\n…og ${rest} til` : ""}`;
 }
 
-async function meetingAttendees(meetingId) {
-  return queryAll({
-    KeyConditionExpression: "PK = :p AND begins_with(SK, :s)",
-    ExpressionAttributeValues: {
-      ":p": `MEETING#${meetingId}`,
-      ":s": "ATTENDEE#",
-    },
+// Forfall på obligatoriske møter: hvem som ikke kan komme, med grunn (vises bare i admin-kanalen)
+const absenceKey = (id, uid) => ({
+  PK: `MEETING#${id}`,
+  SK: `ABSENCE#${uid}`,
+});
+
+// Påmeldte og meldte forfall i ett oppslag (alt ligger i samme partisjon som møtet)
+async function meetingPeople(meetingId) {
+  const items = await queryAll({
+    KeyConditionExpression: "PK = :p",
+    ExpressionAttributeValues: { ":p": `MEETING#${meetingId}` },
   });
+  return {
+    attendees: items.filter((x) => x.SK.startsWith("ATTENDEE#")),
+    absences: items.filter((x) => x.SK.startsWith("ABSENCE#")),
+  };
 }
 
 // Henter deltakerne og bygger meldingen. Feiler henting, vises møtet uten liste.
 async function renderMeetingFull(m) {
-  const attendees = await meetingAttendees(m.id).catch((err) => {
+  const { attendees, absences } = await meetingPeople(m.id).catch((err) => {
     console.warn("Kunne ikke hente deltakere:", err.message);
-    return [];
+    return { attendees: [], absences: [] };
   });
-  return renderMeeting(m, attendees);
+  return renderMeeting(m, attendees, absences);
 }
 
-function renderMeeting(m, attendees = []) {
+function renderMeeting(m, attendees = [], absences = []) {
   const ts = Math.floor(Date.parse(m.startsAt) / 1000);
+  const required = m.required === true;
   return {
     embeds: [
       {
-        title: `📅 ${m.title}`,
+        title: `📅 ${m.title}${required ? " · obligatorisk" : ""}`,
         description:
+          (required
+            ? "❗ **Dette møtet er obligatorisk.** Kan du ikke komme, trykk «Kan ikke komme» og skriv en kort grunn.\n\n"
+            : "") +
           `🕒 <t:${ts}:F> (<t:${ts}:R>)\n` +
           `👥 ${m.slots == null ? `${m.filledSlots} påmeldt` : `${m.filledSlots} av ${m.slots} plasser er tatt`}\n` +
           `📍 ${m.attendedCount ?? 0} har sjekket inn` +
+          (required ? `\n🚫 ${absences.length} har meldt forfall` : "") +
           attendeeLines(attendees),
-        color: 0x5865f2,
+        color: required ? 0xed4245 : 0x5865f2,
         footer: {
-          text: "Meld deg på på forhånd, og sjekk inn med knappen når møtet er i gang.",
+          text: required
+            ? "Meld deg på, og sjekk inn når møtet er i gang. Grunnen for forfall ser bare lederne."
+            : "Meld deg på på forhånd, og sjekk inn med knappen når møtet er i gang.",
         },
       },
     ],
     components: [
       {
         type: 1,
-        components: [
-          button(1, "🙋 Meld meg på", `mt_join:${m.id}`),
-          button(2, "Meld meg av", `mt_leave:${m.id}`),
-          button(3, "📍 Jeg er her", `mt_here:${m.id}`),
-        ],
+        components: required
+          ? [
+              button(1, "🙋 Jeg kommer", `mt_join:${m.id}`),
+              button(2, "🚫 Kan ikke komme", `mt_absent:${m.id}`),
+              button(3, "📍 Jeg er her", `mt_here:${m.id}`),
+            ]
+          : [
+              button(1, "🙋 Meld meg på", `mt_join:${m.id}`),
+              button(2, "Meld meg av", `mt_leave:${m.id}`),
+              button(3, "📍 Jeg er her", `mt_here:${m.id}`),
+            ],
       },
     ],
     allowed_mentions: { parse: [] },
@@ -2363,6 +2510,7 @@ async function cmdMote(i, opts, userId) {
     id,
     title: opts.tittel,
     slots: opts.plasser ?? null, // null = ubegrenset
+    required: opts.påkrevd === true,
     filledSlots: 0,
     attendedCount: 0,
     startsAt,
@@ -2397,6 +2545,10 @@ async function meetingJoin(meetingId, userId) {
     Date.parse(m.startsAt) + settings.meetingCheckinAfterMin * 60000
   )
     return "Det møtet er over 🙂";
+  // Har personen meldt forfall tidligere, fjernes forfallet når hen melder seg på likevel
+  const absence = m.required
+    ? await getItem(absenceKey(meetingId, userId))
+    : null;
   const r = await transact([
     {
       Update: {
@@ -2423,7 +2575,21 @@ async function meetingJoin(meetingId, userId) {
         ConditionExpression: "attribute_not_exists(PK)",
       },
     },
+    ...(absence
+      ? [{ Delete: { TableName: TABLE, Key: absenceKey(meetingId, userId) } }]
+      : []),
   ]);
+  if (r.ok && absence) {
+    const { adminChannelId } = settings;
+    if (adminChannelId)
+      await withTimeout(
+        postToChannel(adminChannelId, {
+          content: `↩️ <@${userId}> kommer likevel på **${m.title}** (<t:${Math.floor(Date.parse(m.startsAt) / 1000)}:F>). Forfallet er fjernet.`,
+          allowed_mentions: { parse: [] },
+        }).catch((e) => console.warn("Admin-varsel feilet", e.message)),
+        1000,
+      );
+  }
   if (r.ok)
     return `🙌 Du er påmeldt **${m.title}**. Husk å trykke «Jeg er her» når du møter opp!`;
   if (failedAt(r, 1)) return "Du er allerede påmeldt 🙂";
@@ -2463,11 +2629,12 @@ async function meetingLeave(meetingId, userId) {
 }
 
 async function meetingHere(meetingId, userId) {
-  const [m, att, settings] = await Promise.all([
+  const [m, attFound, settings] = await Promise.all([
     getItem(meetingKey(meetingId)),
     getItem(attendeeKey(meetingId, userId)),
     loadSettings(),
   ]);
+  let att = attFound;
   if (!m) return "Fant ikke møtet.";
   const start = Date.parse(m.startsAt);
   const opens = start - settings.meetingCheckinBeforeMin * 60000;
@@ -2475,6 +2642,12 @@ async function meetingHere(meetingId, userId) {
     return `Det er litt tidlig 🙂 Innsjekk åpner <t:${Math.floor(opens / 1000)}:R>.`;
   if (Date.now() > start + settings.meetingCheckinAfterMin * 60000)
     return "Innsjekken for det møtet er stengt.";
+  // Obligatorisk møte: alle er ventet, så den som møter opp uten å ha meldt seg på, meldes på automatisk
+  if (!att && m.required) {
+    const joined = await meetingJoin(meetingId, userId);
+    att = await getItem(attendeeKey(meetingId, userId));
+    if (!att) return joined;
+  }
   if (!att) return "Du må melde deg på først (knappen «Meld meg på»).";
   if (att.attended) return "Du er allerede sjekket inn ✅";
 
@@ -2517,6 +2690,138 @@ async function meetingHere(meetingId, userId) {
   if (!r.ok) return "Du er allerede sjekket inn ✅";
   await withTimeout(syncLevel(userId), 1500);
   return `✅ Du er sjekket inn på **${m.title}**${award.delta > 0 ? ` og fikk ${award.delta} poeng${awardNote(award)}` : ""}. Fint at du kom! 💙`;
+}
+
+/* ---------- Forfall på obligatoriske møter ---------- */
+
+// Knappen «Kan ikke komme»: åpner et skjema der grunn er påkrevd
+async function meetingAbsentModal(meetingId, userId) {
+  const [m, att, absence, settings] = await Promise.all([
+    getItem(meetingKey(meetingId)),
+    getItem(attendeeKey(meetingId, userId)),
+    getItem(absenceKey(meetingId, userId)),
+    loadSettings(),
+  ]);
+  if (!m) return ephemeral("Fant ikke møtet.");
+  if (
+    Date.now() >
+    Date.parse(m.startsAt) + settings.meetingCheckinAfterMin * 60000
+  )
+    return ephemeral("Det møtet er over 🙂");
+  if (att?.attended)
+    return ephemeral("Du har allerede sjekket inn, så du er jo her ✅");
+  return json({
+    type: 9,
+    data: {
+      custom_id: `mt_absent_modal:${meetingId}`,
+      title: "Kan ikke komme",
+      components: [
+        {
+          type: 1,
+          components: [
+            {
+              type: 4,
+              custom_id: "reason",
+              label: "Hvorfor kan du ikke komme?",
+              style: 2,
+              required: true,
+              min_length: 3,
+              max_length: 300,
+              placeholder: "F.eks. syk, skole, jobb, reise. Bare lederne ser dette.",
+              ...(absence?.reason ? { value: absence.reason } : {}),
+            },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+// Skjemaet er sendt: lagre forfallet, meld av hvis påmeldt, og gi lederne beskjed
+async function meetingAbsent(meetingId, userId, reason) {
+  const [m, att, previous, settings] = await Promise.all([
+    getItem(meetingKey(meetingId)),
+    getItem(attendeeKey(meetingId, userId)),
+    getItem(absenceKey(meetingId, userId)),
+    loadSettings(),
+  ]);
+  if (!m) return "Fant ikke møtet.";
+  if (!reason || reason.length < 3)
+    return "Du må skrive en kort grunn for å melde forfall.";
+  if (att?.attended)
+    return "Du har allerede sjekket inn, så du kan ikke melde forfall.";
+
+  const ts = now();
+  const items = [
+    {
+      Put: {
+        TableName: TABLE,
+        Item: {
+          ...absenceKey(meetingId, userId),
+          entity: "ABSENCE",
+          meetingId,
+          userId,
+          reason,
+          reportedAt: previous?.reportedAt ?? ts,
+          updatedAt: ts,
+        },
+      },
+    },
+  ];
+  if (att) {
+    items.push(
+      {
+        Delete: {
+          TableName: TABLE,
+          Key: attendeeKey(meetingId, userId),
+          ConditionExpression:
+            "attribute_exists(PK) AND (attribute_not_exists(#at) OR #at = :f)",
+          ExpressionAttributeNames: { "#at": "attended" },
+          ExpressionAttributeValues: { ":f": false },
+        },
+      },
+      {
+        Update: {
+          TableName: TABLE,
+          Key: meetingKey(meetingId),
+          UpdateExpression: "ADD #fs :m",
+          ConditionExpression: "#fs > :zero",
+          ExpressionAttributeNames: { "#fs": "filledSlots" },
+          ExpressionAttributeValues: { ":m": -1, ":zero": 0 },
+        },
+      },
+    );
+  }
+  const r = await transact(items);
+  if (!r.ok) return "Noe skjedde samtidig. Prøv igjen 🙂";
+
+  let adminNote = "";
+  if (settings.adminChannelId) {
+    const when = `<t:${Math.floor(Date.parse(m.startsAt) / 1000)}:F>`;
+    const posted = await withTimeout(
+      postToChannel(settings.adminChannelId, {
+        content:
+          `${previous ? "📝 Oppdatert forfall" : "🚫 Forfall"}: <@${userId}> kan ikke komme på **${m.title}** (${when}).\n` +
+          `> ${reason.replace(/\n+/g, " ")}`,
+        allowed_mentions: { parse: [] },
+      })
+        .then(() => true)
+        .catch((e) => {
+          console.warn("Kunne ikke poste forfall i admin-kanalen", e.message);
+          return false;
+        }),
+      1200,
+      false,
+    );
+    if (!posted)
+      adminNote =
+        "\n_(Jeg fikk ikke sendt det til lederne akkurat nå, men forfallet er lagret.)_";
+  }
+
+  return (
+    `📝 Takk for beskjed! Forfallet ditt for **${m.title}** er registrert, og lederne har fått grunnen.` +
+    `\nOmbestemmer du deg, trykker du bare «Jeg kommer».${adminNote}`
+  );
 }
 
 /* ---------- Forslag til oppgaver ---------- */
@@ -2889,7 +3194,7 @@ async function syncLevel(userId) {
     throw err;
   }
 
-  const guild = process.env.GUILD_ID;
+  const guild = guildIdOf(settings);
   if (guild) {
     const newRole = settings[level.role];
     const oldLevel = LEVELS[levelRank(profile.level)];
@@ -3011,27 +3316,29 @@ async function dispatchAsync(payload) {
 
 // Alt som skjer etter at en ferdigmelding er godkjent. Tungt arbeid (bilde, DM, nivå) kjøres
 // i bakgrunnen, slik at knappen svarer innen Discords 3 sekunder.
-async function afterApproval(r, targetId) {
+async function afterApproval(r, targetId, { dm = true, photo = true } = {}) {
   const settings = await loadSettings();
-  const wantsPhoto = Boolean(r.photoUrl && settings.photoChannelId);
+  const wantsPhoto = Boolean(photo && r.photoUrl && settings.photoChannelId);
   const payload = {
     job: "afterApproval",
     targetId,
     title: r.task.title,
-    dm: `🎉 **${r.task.title}** er godkjent! Du fikk ${r.award.delta} poeng${awardNote(r.award)}. Takk for innsatsen!`,
+    dm: dm
+      ? `🎉 **${r.task.title}** er godkjent! Du fikk ${r.award.delta} poeng${awardNote(r.award)}. Takk for innsatsen!`
+      : undefined,
     photoUrl: wantsPhoto ? r.photoUrl : undefined,
     photoMeta: r.photoMeta,
     photoMaxMb: settings.photoMaxMb,
     photoChannelId: settings.photoChannelId,
     adminChannelId: settings.adminChannelId,
   };
-  const noChannel = Boolean(r.photoUrl && !settings.photoChannelId);
+  const noChannel = Boolean(photo && r.photoUrl && !settings.photoChannelId);
   if (await dispatchAsync(payload))
     return { wantsPhoto, noChannel, queued: true };
 
   // Reserve hvis bakgrunnsjobb ikke kunne startes: gjør det raske her, hopp over bildet
   await Promise.all([
-    withTimeout(tryDM(targetId, { content: payload.dm }), 1200),
+    payload.dm && withTimeout(tryDM(targetId, { content: payload.dm }), 1200),
     withTimeout(syncLevel(targetId), 1200),
   ]);
   return { wantsPhoto, noChannel, queued: false };
@@ -3052,7 +3359,7 @@ function photoErrorHint(err) {
 
 async function runAfterApproval(p) {
   await Promise.all([
-    tryDM(p.targetId, { content: p.dm }),
+    p.dm && tryDM(p.targetId, { content: p.dm }),
     syncLevel(p.targetId).catch((err) =>
       console.warn("syncLevel feilet:", err.message),
     ),
@@ -4245,8 +4552,20 @@ async function buildExport(type, { fraIso, toIso }) {
   const meetings = (
     await scanEntity("MEETING", { field: "startsAt", ...range })
   ).sort((a, b) => a.startsAt.localeCompare(b.startsAt));
+  const absentBy = new Map();
+  for (const a of await scanEntity("ABSENCE"))
+    absentBy.set(a.meetingId, (absentBy.get(a.meetingId) ?? 0) + 1);
   return {
-    header: ["id", "tittel", "start", "plasser", "påmeldte", "møtte_opp"],
+    header: [
+      "id",
+      "tittel",
+      "start",
+      "plasser",
+      "påmeldte",
+      "møtte_opp",
+      "obligatorisk",
+      "meldt_forfall",
+    ],
     rows: meetings.map((m) => [
       m.id,
       m.title,
@@ -4254,6 +4573,8 @@ async function buildExport(type, { fraIso, toIso }) {
       m.slots,
       m.filledSlots,
       m.attendedCount ?? 0,
+      m.required ? "ja" : "nei",
+      absentBy.get(m.id) ?? 0,
     ]),
     userCol: null,
     idCols: [0],
@@ -4264,7 +4585,7 @@ async function buildExport(type, { fraIso, toIso }) {
 // Navn: først servernavn (kallenavn), ellers globalt visningsnavn/brukernavn.
 // Faller tilbake til /users/{id}, som virker uten GUILD_ID og uten at personen er på serveren.
 async function lookupNames(userIds, cache = new Map(), problems = {}) {
-  const guild = process.env.GUILD_ID;
+  const guild = guildIdOf(await loadSettings());
   if (!guild) problems.noGuild = true;
   const missing = [...new Set(userIds)]
     .filter((id) => !cache.has(id))
@@ -4563,6 +4884,27 @@ function roleErrorHint(err) {
   return `Discord svarte ${err.status ?? "med en feil"}.`;
 }
 
+function volunteerButtonPayload(roleId, customText) {
+  const text =
+    customText ??
+    `Vil du hjelpe til og samle poeng? Trykk på knappen under for å få rollen <@&${roleId}>.\n\n` +
+      "Da kan du ta oppgaver med `/oppgaver`, delta på møter og få poeng.\n" +
+      "Du kan når som helst gå ut igjen, og poengene dine blir liggende.";
+  return {
+    embeds: [{ title: "🙋 Bli frivillig", description: text, color: 0x57f287 }],
+    components: [
+      {
+        type: 1,
+        components: [
+          button(3, "🙋 Bli frivillig", "join_vol"),
+          button(2, "Slutt som frivillig", "leave_vol"),
+        ],
+      },
+    ],
+    allowed_mentions: { parse: [] },
+  };
+}
+
 async function cmdFrivilligKnapp(i, opts, userId) {
   if (!isAdmin(i)) return ephemeral(NO_ACCESS);
   const settings = await loadSettings();
@@ -4571,27 +4913,11 @@ async function cmdFrivilligKnapp(i, opts, userId) {
       "Sett først rollen: `/innstillinger innstilling:Discord-rolle: Frivillig verdi:<rolle-ID>`. Lag rollen i Serverinnstillinger → Roller hvis du ikke har den.",
     );
 
-  const text =
-    opts.tekst ??
-    `Vil du hjelpe til og samle poeng? Trykk på knappen under for å få rollen <@&${settings.volunteerRoleId}>.\n\n` +
-      "Da kan du ta oppgaver med `/oppgaver`, delta på møter og få poeng.\n" +
-      "Du kan når som helst gå ut igjen, og poengene dine blir liggende.";
   try {
-    await postToChannel(i.channel_id, {
-      embeds: [
-        { title: "🙋 Bli frivillig", description: text, color: 0x57f287 },
-      ],
-      components: [
-        {
-          type: 1,
-          components: [
-            button(3, "🙋 Bli frivillig", "join_vol"),
-            button(2, "Slutt som frivillig", "leave_vol"),
-          ],
-        },
-      ],
-      allowed_mentions: { parse: [] },
-    });
+    await postToChannel(
+      i.channel_id,
+      volunteerButtonPayload(settings.volunteerRoleId, opts.tekst),
+    );
   } catch (err) {
     console.error("Kunne ikke poste frivillig-knapp", err.message);
     return ephemeral(
@@ -4830,6 +5156,7 @@ async function spawnMeetingFromTemplate(tpl) {
     id,
     title: tpl.title,
     slots: tpl.slots,
+    required: tpl.required === true,
     filledSlots: 0,
     attendedCount: 0,
     startsAt: osloLocalToIso(occ, tpl.time),
@@ -4913,6 +5240,7 @@ async function cmdMoteMalNy(i, opts, userId) {
     anchorDay: dag,
     startDate,
     slots: opts.plasser ?? null, // null = ubegrenset
+    required: opts.påkrevd === true, // obligatorisk: forfall må meldes med grunn
     leadDays: opts.dagerfor ?? (await loadSettings()).meetingLeadDays,
     channelId: opts.kanal ?? i.channel_id,
     createdBy: userId,
@@ -4929,7 +5257,7 @@ async function cmdMoteMalNy(i, opts, userId) {
   );
 
   const spawned = await spawnMeetingFromTemplate(tpl);
-  const head = `✅ Møtemal **${tpl.title}** opprettet (${describeMeetingSchedule(tpl)}, i <#${tpl.channelId}>).`;
+  const head = `✅ Møtemal **${tpl.title}** opprettet (${describeMeetingSchedule(tpl)}, i <#${tpl.channelId}>${tpl.required ? ", obligatorisk" : ""}).`;
   if (spawned?.meeting)
     return ephemeral(`${head}\nNeste møte er allerede lagt ut i kanalen.`);
   if (spawned?.error)
@@ -4949,9 +5277,38 @@ async function cmdMoteMalListe(i) {
     return ephemeral("Ingen møtemaler ennå. Lag en med `/møtemal-ny`.");
   const lines = templates.map(
     (t) =>
-      `• **${t.title}** · ${describeMeetingSchedule(t)} · <#${t.channelId}> · ${t.slots == null ? "ubegrenset" : `${t.slots} plasser`} · legges ut ${t.leadDays === 0 ? "samme dag" : `${t.leadDays} dager før`} · neste: ${fmtDate(upcomingOccurrence(t))}`,
+      `• **${t.title}** · ${describeMeetingSchedule(t)} · <#${t.channelId}> · ${t.required ? "❗ obligatorisk · " : ""}${t.slots == null ? "ubegrenset" : `${t.slots} plasser`} · legges ut ${t.leadDays === 0 ? "samme dag" : `${t.leadDays} dager før`} · neste: ${fmtDate(upcomingOccurrence(t))}`,
   );
   return ephemeral(`**Møtemaler**\n${lines.join("\n")}`.slice(0, 1990));
+}
+
+// Endre en eksisterende møtemal. Gjelder møter som legges ut etter endringen.
+async function cmdMoteMalRediger(i, opts) {
+  if (!canManage(i)) return ephemeral(NO_ACCESS);
+  if (opts.påkrevd == null) return ephemeral("Velg hva du vil endre.");
+  let tpl;
+  try {
+    const r = await db.send(
+      new UpdateCommand({
+        TableName: TABLE,
+        Key: meetingTemplateKey(opts.mal),
+        UpdateExpression: "SET #rq = :rq, updatedAt = :ts",
+        ConditionExpression: "attribute_exists(PK)",
+        ExpressionAttributeNames: { "#rq": "required" },
+        ExpressionAttributeValues: { ":rq": opts.påkrevd === true, ":ts": now() },
+        ReturnValues: "ALL_NEW",
+      }),
+    );
+    tpl = r.Attributes;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException")
+      return ephemeral("Fant ikke den malen. Velg en fra listen.");
+    throw err;
+  }
+  return ephemeral(
+    `✅ **${tpl.title}** er nå ${tpl.required ? "**obligatorisk**. Den som ikke kan komme, må oppgi en grunn" : "**ikke obligatorisk** lenger"}.\n` +
+      `Gjelder møter som legges ut fra nå av. Et møte som allerede er lagt ut, beholder det gamle oppsettet.`,
+  );
 }
 
 async function cmdMoteMalSlett(i, opts) {
@@ -4972,6 +5329,343 @@ async function cmdMoteMalSlett(i, opts) {
   return ephemeral(
     "🗑️ Møtemalen er slettet. Møter som allerede er lagt ut, blir liggende.",
   );
+}
+
+/* ============================================================
+ * /oppsett: lager rollene og kanalene boten trenger
+ * Trygt å kjøre flere ganger: bruker det som finnes (lagret ID eller samme navn),
+ * lager bare det som mangler, og sletter eller endrer aldri noe.
+ * ============================================================ */
+
+const PERM = {
+  ADMIN: 1n << 3n,
+  MANAGE_CHANNELS: 1n << 4n,
+  VIEW: 1n << 10n,
+  SEND: 1n << 11n,
+  EMBED: 1n << 14n,
+  ATTACH: 1n << 15n,
+  HISTORY: 1n << 16n,
+  MANAGE_ROLES: 1n << 28n,
+};
+const permBits = (...p) => p.reduce((a, b) => a | b, 0n).toString();
+
+// botAssigns: boten gir og fjerner rollen selv, så den må ligge under botens rolle
+const SETUP_ROLES = [
+  { key: "adminRoleId", name: "Frivillig-admin", color: 0xe67e22 },
+  { key: "leaderRoleId", name: "Voksen leder", color: 0x3498db },
+  { key: "volunteerRoleId", name: "Frivillig", color: 0x57f287, botAssigns: true },
+  { key: "roleRecruitId", name: "Rekrutt", color: 0x95a5a6, botAssigns: true },
+  { key: "roleVeteranId", name: "Veteran", color: 0x5865f2, botAssigns: true },
+  { key: "roleLegendId", name: "Legende", color: 0xf1c40f, botAssigns: true },
+];
+
+// staff: bare admin/ledere. volunteers: frivillige og ledere. public: alle leser, bare boten og ledere skriver.
+// Første nøkkel bestemmer kanalen. De andre fylles bare inn hvis de ikke peker på en kanal fra før.
+const SETUP_CHANNELS = [
+  {
+    keys: ["adminChannelId"],
+    name: "frivillig-admin",
+    access: "staff",
+    topic:
+      "Godkjenninger, forslag, ideer, nye gjester og forfall. Bare admin og ledere ser denne kanalen.",
+  },
+  {
+    keys: ["hubChannelId", "fallbackChannelId", "summaryChannelId"],
+    name: "frivillig",
+    access: "volunteers",
+    topic:
+      "For frivillige: /oppgaver, /mine-oppgaver, /poeng og møter. Ukesoppsummeringen kommer også her.",
+  },
+  {
+    keys: ["volunteerChannelId"],
+    name: "bli-frivillig",
+    access: "public",
+    topic: "Trykk på knappen for å bli frivillig.",
+  },
+  {
+    keys: ["photoChannelId"],
+    name: "før-og-etter",
+    access: "public",
+    topic: "Bilder av fullførte oppgaver. Bilder viser oppgaven, ikke personer.",
+  },
+  {
+    keys: ["shoutoutChannelId"],
+    name: "månedens-frivillige",
+    access: "public",
+    topic: "Månedens frivillige kåres her den 1. hver måned.",
+  },
+];
+
+function setupOverwrites(access, ids) {
+  const talk = permBits(PERM.VIEW, PERM.SEND, PERM.HISTORY);
+  const list = new Map();
+  const add = (id, type, allow, deny = "0") =>
+    id && !list.has(id) && list.set(id, { id, type, allow, deny });
+  add(
+    ids.bot,
+    1,
+    permBits(PERM.VIEW, PERM.SEND, PERM.EMBED, PERM.ATTACH, PERM.HISTORY),
+  );
+  add(ids.adminRoleId, 0, talk);
+  add(ids.leaderRoleId, 0, talk);
+  if (access === "volunteers") add(ids.volunteerRoleId, 0, talk);
+  if (access === "public")
+    add(ids.everyone, 0, permBits(PERM.VIEW, PERM.HISTORY), permBits(PERM.SEND));
+  else add(ids.everyone, 0, "0", permBits(PERM.VIEW));
+  return [...list.values()];
+}
+
+async function withRetry(fn, tries = 3) {
+  for (let n = 1; ; n++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err.status !== 429 || n >= tries) throw err;
+      await new Promise((r) => setTimeout(r, 3000 * n));
+    }
+  }
+}
+
+const setupError = (err, perm) =>
+  err.status === 403
+    ? `boten mangler tillatelsen *${perm}*`
+    : `Discord svarte ${err.status ?? err.message}`;
+
+async function cmdOppsett(i, opts, userId) {
+  if (!isAdmin(i)) return ephemeral(NO_ACCESS);
+  if (!i.guild_id) return ephemeral("Kjør `/oppsett` i serveren, ikke på DM.");
+  const started = await dispatchAsync({
+    job: "setup",
+    guildId: i.guild_id,
+    appId: i.application_id,
+    token: i.token,
+    userId,
+    postButton: opts.knapp === true,
+  });
+  if (!started)
+    return ephemeral(
+      "Jeg klarte ikke å starte oppsettet. Sjekk at Lambdaen har tillatelsen `lambda:InvokeFunction` (se SETUP.md).",
+    );
+  return json({ type: 5, data: { flags: 64 } }); // «Boten tenker …», svaret kommer når jobben er ferdig
+}
+
+async function runSetup(p) {
+  const g = p.guildId;
+  const roleLines = [];
+  const channelLines = [];
+  const warnings = [];
+  const steps = [];
+  const updates = { guildId: g };
+  let fatal = null;
+
+  try {
+    const settings = await loadSettings();
+    const me = await discord("/users/@me");
+    const [roles, channels, member] = await Promise.all([
+      discord(`/guilds/${g}/roles`),
+      discord(`/guilds/${g}/channels`),
+      discord(`/guilds/${g}/members/${me.id}`),
+    ]);
+    const mine = roles.filter((r) => member.roles.includes(r.id));
+    const perms = [roles.find((r) => r.id === g), ...mine].reduce(
+      (a, r) => a | BigInt(r?.permissions ?? 0),
+      0n,
+    );
+    const has = (bit) => (perms & (PERM.ADMIN | bit)) !== 0n;
+    const botTop = Math.max(0, ...mine.map((r) => r.position));
+    const roleById = new Map(roles.map((r) => [r.id, r]));
+    const ids = { everyone: g, bot: me.id };
+
+    // ---- Roller ----
+    for (const spec of SETUP_ROLES) {
+      let role = roleById.get(settings[spec.key]) ?? null;
+      let how = "fantes fra før";
+      if (!role) {
+        role =
+          roles.find(
+            (r) => r.name.toLowerCase() === spec.name.toLowerCase(),
+          ) ?? null;
+        if (role) how = "fantes fra før med samme navn, tatt i bruk";
+      }
+      if (!role) {
+        if (!has(PERM.MANAGE_ROLES)) {
+          roleLines.push(`• ${spec.name}: ❌ ikke laget (boten mangler *Manage Roles*)`);
+          continue;
+        }
+        try {
+          role = await withRetry(() =>
+            discord(`/guilds/${g}/roles`, {
+              method: "POST",
+              body: {
+                name: spec.name,
+                color: spec.color,
+                permissions: "0",
+                hoist: false,
+                mentionable: false,
+              },
+            }),
+          );
+          how = "laget nå";
+        } catch (err) {
+          roleLines.push(`• ${spec.name}: ❌ ${setupError(err, "Manage Roles")}`);
+          continue;
+        }
+      } else if (spec.botAssigns && role.position >= botTop) {
+        warnings.push(
+          `<@&${role.id}> ligger over botens rolle, så boten kan ikke gi den. Dra botens rolle over den i Serverinnstillinger → Roller.`,
+        );
+      }
+      updates[spec.key] = role.id;
+      ids[spec.key] = role.id;
+      roleLines.push(`• <@&${role.id}>: ${how}`);
+    }
+
+    // ---- Kategori ----
+    const chanById = new Map(channels.map((c) => [c.id, c]));
+    let category =
+      (chanById.get(settings.categoryId)?.type === 4
+        ? chanById.get(settings.categoryId)
+        : null) ??
+      channels.find((c) => c.type === 4 && c.name.toLowerCase() === "frivillig") ??
+      null;
+    if (!category && has(PERM.MANAGE_CHANNELS)) {
+      try {
+        category = await withRetry(() =>
+          discord(`/guilds/${g}/channels`, {
+            method: "POST",
+            body: { name: "Frivillig", type: 4 },
+          }),
+        );
+      } catch (err) {
+        warnings.push(
+          `Fikk ikke laget kategorien «Frivillig» (${setupError(err, "Manage Channels")}). Kanalene legges uten kategori.`,
+        );
+      }
+    }
+    if (category) updates.categoryId = category.id;
+
+    // ---- Kanaler ----
+    let newVolunteerChannel = false;
+    for (const spec of SETUP_CHANNELS) {
+      const [primary, ...extra] = spec.keys;
+      const stored = chanById.get(settings[primary]);
+      let ch = stored && stored.type !== 4 ? stored : null;
+      let how = "fantes fra før";
+      if (!ch) {
+        ch = channels.find((c) => c.type === 0 && c.name === spec.name) ?? null;
+        if (ch) how = "fantes fra før med samme navn, tatt i bruk";
+      }
+      if (!ch) {
+        if (!has(PERM.MANAGE_CHANNELS)) {
+          channelLines.push(`• #${spec.name}: ❌ ikke laget (boten mangler *Manage Channels*)`);
+          continue;
+        }
+        try {
+          ch = await withRetry(() =>
+            discord(`/guilds/${g}/channels`, {
+              method: "POST",
+              body: {
+                name: spec.name,
+                type: 0,
+                topic: spec.topic,
+                parent_id: category?.id,
+                permission_overwrites: setupOverwrites(spec.access, ids),
+              },
+            }),
+          );
+          how = "laget nå";
+          if (primary === "volunteerChannelId") newVolunteerChannel = true;
+        } catch (err) {
+          channelLines.push(`• #${spec.name}: ❌ ${setupError(err, "Manage Channels")}`);
+          continue;
+        }
+      }
+      updates[primary] = ch.id;
+      for (const k of extra)
+        if (!settings[k] || !chanById.has(settings[k])) updates[k] = ch.id;
+      channelLines.push(`• <#${ch.id}>: ${how}`);
+    }
+
+    await saveSettings(updates);
+    await loadSettings();
+
+    // ---- «Bli frivillig»-knappen ----
+    if (updates.volunteerRoleId && updates.volunteerChannelId && (newVolunteerChannel || p.postButton)) {
+      try {
+        await postToChannel(
+          updates.volunteerChannelId,
+          volunteerButtonPayload(updates.volunteerRoleId),
+        );
+        steps.push(`Fest «Bli frivillig»-meldingen i <#${updates.volunteerChannelId}> (høyreklikk → Fest melding).`);
+      } catch (err) {
+        warnings.push(`Fikk ikke lagt ut «Bli frivillig»-knappen: ${channelErrorHint(err)}`);
+      }
+    } else if (updates.volunteerChannelId && !newVolunteerChannel) {
+      steps.push(
+        `Knappen ble ikke lagt ut på nytt i <#${updates.volunteerChannelId}>. Kjør \`/oppsett knapp:True\` hvis den mangler.`,
+      );
+    }
+
+    // ---- Rollekravet slås på første gang Frivillig-rollen settes ----
+    if (!settings.volunteerRoleId && updates.volunteerRoleId) {
+      const queued = await dispatchAsync({
+        job: "grantRole",
+        requesterId: p.userId,
+        guildId: g,
+        roleId: updates.volunteerRoleId,
+        adminChannelId: updates.adminChannelId ?? settings.adminChannelId,
+      });
+      steps.push(
+        queued
+          ? `Frivillig-rollen kreves nå for å samle poeng. Alle som allerede har poeng, får rollen nå, og du får en DM når det er gjort.`
+          : `Frivillig-rollen kreves nå for å samle poeng. Kjør \`/frivillig-synk\` så de som allerede har poeng, får rollen.`,
+      );
+    }
+
+    steps.unshift(
+      `Gi deg selv og de andre voksne rollene ${ids.adminRoleId ? `<@&${ids.adminRoleId}>` : "Admin"} og ${ids.leaderRoleId ? `<@&${ids.leaderRoleId}>` : "Voksen leder"} (høyreklikk på personen → Roller). Discord-administratorer regnes som admin uansett.`,
+    );
+  } catch (err) {
+    console.error("Oppsett feilet:", err);
+    fatal = err;
+  }
+
+  const description = fatal
+    ? `❌ Oppsettet stoppet: ${fatal.status === 403 ? "boten mangler tilgang til serveren (sjekk at den er invitert med *Manage Roles* og *Manage Channels*)." : String(fatal.message).slice(0, 300)}`
+    : [
+        "**Roller**",
+        ...roleLines,
+        "",
+        "**Kanaler**",
+        ...channelLines,
+        ...(warnings.length ? ["", "**⚠️ Sjekk dette**", ...warnings.map((w) => `• ${w}`)] : []),
+        "",
+        "**Neste steg**",
+        ...steps.map((s) => `• ${s}`),
+        "",
+        "_Kjører du `/oppsett` igjen, lages bare det som mangler. Ingenting slettes eller endres._",
+      ].join("\n");
+
+  const payload = {
+    embeds: [
+      {
+        title: fatal ? "Oppsett" : "✅ Oppsett ferdig",
+        description: description.slice(0, 4000),
+        color: fatal ? 0xed4245 : 0x57f287,
+      },
+    ],
+    allowed_mentions: { parse: [] },
+  };
+  try {
+    await discord(`/webhooks/${p.appId}/${p.token}/messages/@original`, {
+      method: "PATCH",
+      body: payload,
+    });
+  } catch (err) {
+    console.warn("Kunne ikke oppdatere oppsett-svaret, sender DM:", err.message);
+    await tryDM(p.userId, payload);
+  }
+  return { done: !fatal, updates };
 }
 
 /* ============================================================
@@ -5004,6 +5698,11 @@ export const handler = async (event) => {
   const interaction = JSON.parse(body);
 
   try {
+    // Innstillingene (bl.a. admin- og lederrolle) trengs til tilgangssjekkene
+    if (interaction.type !== 1)
+      await loadSettings().catch((e) =>
+        console.warn("Kunne ikke laste innstillinger:", e.message),
+      );
     switch (interaction.type) {
       case 1: // PING
         return json({ type: 1 });

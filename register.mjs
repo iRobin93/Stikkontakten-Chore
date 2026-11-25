@@ -359,6 +359,11 @@ const commands = [
         min_value: 1,
         max_value: 200,
       },
+      {
+        type: BOOLEAN,
+        name: "påkrevd",
+        description: "Obligatorisk: må oppgi grunn hvis man ikke kan komme",
+      },
     ],
   },
   {
@@ -478,6 +483,30 @@ const commands = [
         min_value: 0,
         max_value: 14,
       },
+      {
+        type: BOOLEAN,
+        name: "påkrevd",
+        description: "Obligatorisk: må oppgi grunn hvis man ikke kan komme",
+      },
+    ],
+  },
+  {
+    name: "møtemal-rediger",
+    description: "Endre en møtemal (admin/leder)",
+    options: [
+      {
+        type: STRING,
+        name: "mal",
+        description: "Hvilken møtemal?",
+        required: true,
+        autocomplete: true,
+      },
+      {
+        type: BOOLEAN,
+        name: "påkrevd",
+        description: "Obligatorisk: må oppgi grunn hvis man ikke kan komme",
+        required: true,
+      },
     ],
   },
   { name: "møtemal-liste", description: "Se alle møtemaler (admin/leder)" },
@@ -491,6 +520,17 @@ const commands = [
         description: "Hvilken møtemal?",
         required: true,
         autocomplete: true,
+      },
+    ],
+  },
+  {
+    name: "oppsett",
+    description: "Lag rollene og kanalene boten trenger (admin)",
+    options: [
+      {
+        type: BOOLEAN,
+        name: "knapp",
+        description: "Legg ut «Bli frivillig»-knappen på nytt",
       },
     ],
   },
